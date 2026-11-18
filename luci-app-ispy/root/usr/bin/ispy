@@ -22,7 +22,7 @@
 #
 # SPDX-License-Identifier: MIT
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 RUNDIR=/var/run/ispy
 
 # One row per test. Columns after "message" are measurement controls:

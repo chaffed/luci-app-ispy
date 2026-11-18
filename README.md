@@ -73,7 +73,8 @@ its reports remain the FCC's own yardstick for "delivers what it advertises".
 ### Automatic copy on a USB drive
 
 Plug a drive into the router and pick its folder under **Settings → Storage →
-Copy to a USB drive**; the page lists the drives it finds. After every test
+Copy to a USB drive**; the page lists the drives it finds (on GL.iNet
+firmware a drive appears as `/tmp/mountd/disk1_part1`). After every test
 ISPy then saves two files there:
 
 | File | What it is |
@@ -126,14 +127,20 @@ sold as "up to" a speed.
 
 ### 1. Enable LuCI (GL.iNet firmware)
 
-GL.iNet firmware ships its own web UI. LuCI is an optional add-on. In the GL
-admin panel open **System → Advanced Settings** and install/open LuCI, or over SSH run:
+GL.iNet firmware ships its own web UI, and LuCI is an optional add-on that is
+not installed out of the box. In the GL admin panel open **System → Advanced
+Settings** and install LuCI, or run over SSH what that button runs:
 
 ```sh
-opkg update && opkg install luci
+sh /usr/bin/init_luci.sh web
 ```
 
-LuCI is then at `http://192.168.8.1/cgi-bin/luci`.
+LuCI is then at `http://192.168.8.1:8080/cgi-bin/luci` (the GL admin panel
+stays on port 80). Log in as `root` with the router's admin password.
+Checked on a GL-BE9300 with firmware 4.10.1.
+
+On stock OpenWrt, LuCI is normally already there at
+`http://192.168.1.1/cgi-bin/luci`; if not, `opkg update && opkg install luci`.
 
 ### 2. Install ISPy
 
@@ -179,13 +186,21 @@ processor load during the test.
   1 Gbit/s line with the default 10 s per direction, that's roughly 1.4 GB per
   test, or about 1 TB/month at an hourly interval. Use a longer interval or a
   shorter duration on capped plans.
-- **Rate limits.** Cloudflare's speed-test endpoint rate-limits clients that
-  move a lot of data. Such tests are stored as *failed* (`HTTP 429`). On fast
-  lines, if you see these regularly, lengthen the interval or switch to the
-  Ookla CLI.
+- **Rate limits: the built-in engine is for slower lines.** Cloudflare's
+  speed-test endpoint limits how much one address may download. On a
+  GL-BE9300 on a line of 700+ Mbit/s (November 2026), the first 10-second
+  test was refused after about 840 MB, and Cloudflare then answered
+  `HTTP 429` with a one-hour `Retry-After`. A refused test is stored as
+  *failed*, never as a slow result, but on such a line every 10-second
+  test is refused. Cloudflare does not publish the limit and this is one
+  observation; as a rough guide the built-in engine fits lines up to about
+  300 Mbit/s at the default 10 seconds. Above that, install the Ookla CLI
+  (below).
 - **Hardware acceleration.** The "other traffic" and "WAN total" figures come
-  from the router's WAN interface counters. On routers with hardware flow
-  offloading, check once that these counters see traffic from your devices:
+  from the router's WAN interface counters. On a GL-BE9300 (firmware 4.10.1)
+  these counters do include hardware-accelerated traffic from other devices:
+  a 729 MB download on a Wi-Fi client showed up as 770 MB on the WAN port.
+  On other routers with hardware flow offloading, check it once:
   start a large download on a computer, press **Run test now**, and look at
   *Other traffic before test* in the Statistics table. If it stays near zero,
   the counters don't see accelerated traffic. The speed figures are still

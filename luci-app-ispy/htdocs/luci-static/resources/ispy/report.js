@@ -433,6 +433,28 @@ function periodWindow(period, now, fromDate, toDate) {
 	return { from: now - (+period) * 86400, to: now };
 }
 
+/* Whether two time zone names give the same local time. The router's name
+ * is spelled with spaces ("America/Los Angeles") and may be an alias of the
+ * browser's, so the clocks are compared in winter and in summer rather than
+ * the names. A name the browser does not know cannot be judged: no warning. */
+function sameZone(a, b) {
+	a = String(a).replace(/ /g, '_');
+	b = String(b).replace(/ /g, '_');
+	if (a === b)
+		return true;
+	try {
+		var year = new Date().getFullYear();
+		var clock = function(zone, month) {
+			return new Intl.DateTimeFormat('en-US', { timeZone: zone, hourCycle: 'h23',
+				year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric'
+			}).format(new Date(Date.UTC(year, month, 15, 12)));
+		};
+		return clock(a, 0) === clock(b, 0) && clock(a, 6) === clock(b, 6);
+	} catch (e) {
+		return true;
+	}
+}
+
 /* Things the reader of the report page should fix or know before using it. */
 function hints(o) {
 	var out = [], sub = o.sub || {}, zone = (o.meta || {}).zonename, tz = timeZone();
@@ -440,7 +462,7 @@ function hints(o) {
 		out.push(_('Your advertised speeds are not set, so the report cannot compare against them.'));
 	if (!sub.isp || !sub.subscriber)
 		out.push(_('Provider and subscriber details are empty.'));
-	if (zone && zone !== 'UTC' && tz && tz !== zone)
+	if (zone && zone !== 'UTC' && tz && !sameZone(tz, zone))
 		out.push(_('This browser’s time zone (%s) differs from the router’s (%s). Times and peak hours in the report follow the browser, so use a device set to the router’s time zone.').format(tz, zone));
 	return out;
 }

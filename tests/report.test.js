@@ -5,6 +5,7 @@
  * it draws.
  * Run: node tests/report.test.js
  */
+process.env.TZ = 'America/Los_Angeles';   /* the same answers on every machine */
 var fs = require('fs'), path = require('path'), gen = require('./gen.js');
 var PKG = path.join(__dirname, '../luci-app-ispy');
 var FILES = {
@@ -182,6 +183,21 @@ ok('a line that delivers is reported as such', /Measured download speeds were co
 var hints = p2.el['ispy-hints'].textContent;
 ok('hint: details missing', p2.el['ispy-hints'].hidden === false && /Provider and subscriber details are empty/.test(hints));
 ok('hint: time zone differs from the router', /differs from the router/.test(hints), hints);
+
+/* the router spells zone names with spaces, and may use an alias */
+function zoneHint(name) {
+	var q = open(gen.HEADER + '\n', { exported: now, version: '9.9.9', plan_down: '1000', plan_up: '40',
+		sub: { isp: 'x', subscriber: 'y' }, meta: { zonename: name } });
+	return /differs from the router/.test(q.el['ispy-hints'].textContent);
+}
+ok('this test runs in a known time zone', zone === 'America/Los_Angeles', zone);
+ok('no time zone hint for the router\'s spelling with a space', zoneHint('America/Los Angeles') === false);
+ok('no time zone hint for an alias of the same zone', zoneHint('US/Pacific') === false);
+ok('time zone hint for a zone with another clock', zoneHint('America/Denver') === true);
+ok('time zone hint for a zone that matches only in summer', zoneHint('America/Phoenix') === true);
+ok('time zone hint for a zone that matches only in winter', zoneHint('Pacific/Pitcairn') === true);
+ok('no time zone hint for another name with the same clock all year', zoneHint('America/Vancouver') === false);
+ok('no time zone hint for a name the browser does not know', zoneHint('Nowhere/Special') === false);
 
 var p3 = open(gen.HEADER + '\n', { exported: now, version: '9.9.9', plan_down: '', plan_up: '', sub: {}, meta: {} });
 ok('no results: says so instead of failing', /No completed speed tests were recorded in this period\./.test(p3.html()));
