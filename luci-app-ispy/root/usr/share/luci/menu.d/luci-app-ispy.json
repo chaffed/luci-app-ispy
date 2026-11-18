@@ -1,0 +1,30 @@
+{
+	"admin/services/ispy": {
+		"title": "ISPy Speed Monitor",
+		"order": 60,
+		"action": {
+			"type": "alias",
+			"path": "admin/services/ispy/overview"
+		},
+		"depends": {
+			"acl": [ "luci-app-ispy" ],
+			"uci": { "ispy": true }
+		}
+	},
+	"admin/services/ispy/overview": {
+		"title": "Overview",
+		"order": 1,
+		"action": {
+			"type": "view",
+			"path": "ispy/overview"
+		}
+	},
+	"admin/services/ispy/settings": {
+		"title": "Settings",
+		"order": 2,
+		"action": {
+			"type": "view",
+			"path": "ispy/settings"
+		}
+	}
+}

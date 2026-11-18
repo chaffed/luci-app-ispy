@@ -1,0 +1,8 @@
+#!/bin/sh
+# Make the new menu entry and rpcd object visible without a reboot.
+rm -f /tmp/luci-indexcache* 2>/dev/null
+rm -rf /tmp/luci-modulecache 2>/dev/null
+/etc/init.d/rpcd reload 2>/dev/null
+/etc/init.d/ispy enable 2>/dev/null
+/etc/init.d/ispy restart 2>/dev/null
+exit 0

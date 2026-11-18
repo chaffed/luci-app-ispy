@@ -1,0 +1,33 @@
+#!/bin/sh
+# rpcd plugin exposing ISPy to LuCI as ubus object "luci.ispy"
+# shellcheck shell=dash disable=SC1091
+
+. /usr/share/libubox/jshn.sh
+
+case "$1" in
+	list)
+		echo '{"status":{},"results":{"since":0,"limit":0},"run":{},"clear":{}}'
+		;;
+	call)
+		case "$2" in
+			status)
+				/usr/bin/ispy status
+				;;
+			results)
+				read -r input
+				json_load "$input"
+				json_get_var since since
+				json_get_var limit limit
+				/usr/bin/ispy results-json "${since:-0}" "${limit:-4000}"
+				;;
+			run)
+				/usr/bin/ispy start >/dev/null 2>&1
+				echo '{"started":true}'
+				;;
+			clear)
+				/usr/bin/ispy clear >/dev/null 2>&1
+				echo '{"cleared":true}'
+				;;
+		esac
+		;;
+esac

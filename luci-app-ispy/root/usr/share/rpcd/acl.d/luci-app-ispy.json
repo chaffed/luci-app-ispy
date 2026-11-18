@@ -1,0 +1,17 @@
+{
+	"luci-app-ispy": {
+		"description": "Grant access to ISPy speed monitor",
+		"read": {
+			"ubus": {
+				"luci.ispy": [ "status", "results" ]
+			},
+			"uci": [ "ispy", "network" ]
+		},
+		"write": {
+			"ubus": {
+				"luci.ispy": [ "run", "clear" ]
+			},
+			"uci": [ "ispy" ]
+		}
+	}
+}

@@ -1,0 +1,48 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Lint shell scripts
+        run: |
+          shellcheck luci-app-ispy/root/usr/bin/ispy \
+            luci-app-ispy/root/etc/init.d/ispy \
+            luci-app-ispy/root/usr/libexec/rpcd/luci.ispy \
+            luci-app-ispy/root/etc/uci-defaults/* \
+            scripts/*.sh
+
+      - name: Check JavaScript syntax and JSON
+        run: |
+          for f in luci-app-ispy/htdocs/luci-static/resources/view/ispy/*.js; do
+            node -e "new Function(require('fs').readFileSync('$f', 'utf8'))"
+          done
+          for f in luci-app-ispy/root/usr/share/luci/menu.d/*.json luci-app-ispy/root/usr/share/rpcd/acl.d/*.json; do
+            python3 -m json.tool "$f" > /dev/null
+          done
+
+      - name: Build ipk
+        run: scripts/build-ipk.sh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: luci-app-ispy
+          path: dist/*.ipk
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.ipk
+          generate_release_notes: true

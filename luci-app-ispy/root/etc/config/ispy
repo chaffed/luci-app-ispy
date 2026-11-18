@@ -1,0 +1,12 @@
+
+config ispy 'main'
+	option enabled '1'
+	option interval '60'
+	option backend 'auto'
+	option streams '4'
+	option duration '10'
+	option ping_host '1.1.1.1'
+	option ping_count '10'
+	option busy_threshold '0'
+	option results_file '/etc/ispy/results.csv'
+	option max_results '4000'
