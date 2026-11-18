@@ -45,17 +45,19 @@ var CSS = [
 	'.ispy-bar .ispy-info{opacity:.85}',
 	'.ispy-bar .ispy-actions{display:flex;flex-wrap:wrap;gap:.4em;align-items:center}',
 	'.ispy-ranges{display:inline-flex;border:1px solid rgba(127,127,127,.4);border-radius:6px;overflow:hidden}',
-	'.ispy-ranges button{border:0;border-radius:0;margin:0;padding:.35em .8em;background:transparent;color:inherit;cursor:pointer}',
+	'.ispy-ranges button{border:0;border-radius:0;margin:0;padding:.35em .9em;min-height:40px;min-width:44px;background:transparent;color:inherit;cursor:pointer}',
+	'.ispy-ranges button:focus-visible,.ispy-chart svg:focus-visible{outline:2px solid #2f7ed8;outline-offset:2px}',
 	'.ispy-ranges button.active{background:#2f7ed8;color:#fff}',
 	'.ispy-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:.75em;margin-bottom:1.25em}',
 	'.ispy-card{border:1px solid rgba(127,127,127,.3);border-radius:8px;padding:.75em 1em;min-width:0}',
-	'.ispy-card .k{font-size:.8em;text-transform:uppercase;letter-spacing:.04em;opacity:.7}',
+	'.ispy-card .k{font-size:.8em;text-transform:uppercase;letter-spacing:.04em;opacity:.8}',
 	'.ispy-card .v{font-size:1.6em;font-weight:600;line-height:1.3;white-space:nowrap}',
 	'.ispy-card .s{font-size:.85em;opacity:.75}',
-	'.ispy-grade{display:inline-block;min-width:1.6em;text-align:center;border-radius:6px;color:#fff;padding:0 .3em}',
+	'.ispy-grade{display:inline-block;min-width:1.6em;text-align:center;border-radius:6px;color:#111;padding:0 .3em}',
 	'.ispy-chart{position:relative;margin:.25em 0 1.5em}',
 	'.ispy-chart svg{width:100%;height:auto;display:block;overflow:visible}',
-	'.ispy-chart text{fill:currentColor;font-size:11px;opacity:.75}',
+	'.ispy-chart text{fill:currentColor;font-size:13px;opacity:.85}',
+	'.ispy-chart svg:focus{outline:none}',
 	'.ispy-chart .grid{stroke:currentColor;stroke-opacity:.12}',
 	'.ispy-legend{display:flex;flex-wrap:wrap;gap:1em;font-size:.9em;margin:.2em 0 .3em}',
 	'.ispy-legend i{display:inline-block;width:12px;height:3px;margin-right:.35em;vertical-align:middle}',
@@ -63,7 +65,8 @@ var CSS = [
 	'.ispy-tip b{font-weight:600}',
 		'.ispy-empty{padding:2em;text-align:center;opacity:.7;border:1px dashed rgba(127,127,127,.4);border-radius:8px}',
 	'.ispy-ok{color:#3fa66b}.ispy-err{color:#d9534f}.ispy-skip{opacity:.6}',
-	'.ispy-muted{opacity:.65;font-size:.9em}',
+	'.ispy-muted{opacity:.8;font-size:.9em}',
+	'.ispy-sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}',
 	'.ispy-scroll{overflow-x:auto;max-width:100%}'
 ].join('\n');
 
@@ -166,6 +169,8 @@ function S(tag, attrs, children) {
 
 function legend(items) {
 	return E('div', { 'class': 'ispy-legend' }, items.map(function(it) {
+		if (it.text)
+			return E('span', { 'style': 'color:' + it.color }, it.label);
 		return E('span', {}, [
 			E('i', { 'style': 'background:%s%s'.format(it.color, it.dash ? ';height:0;border-top:2px dashed ' + it.color : '') }),
 			it.label
@@ -201,7 +206,8 @@ function lineChart(opts) {
 	var X = function(t) { return ml + (t - t0) / (t1 - t0) * pw; };
 	var Y = function(v) { return mt + ph - v / ymax * ph; };
 
-	var svg = S('svg', { viewBox: '0 0 %d %d'.format(W, H), role: 'img' });
+	var svg = S('svg', { viewBox: '0 0 %d %d'.format(W, H), role: 'img', tabindex: rows.length ? 0 : null,
+		'aria-label': opts.label ? opts.label + '. ' + _('Use the left and right arrow keys to step through tests.') : null });
 
 	/* y grid */
 	for (var y = 0; y <= ymax + 1e-9; y += ystep) {
@@ -257,9 +263,10 @@ function lineChart(opts) {
 	/* failed / skipped tests as ticks on the x axis */
 	if (opts.marks)
 		rows.forEach(function(r) {
-			if (r.status !== 'ok')
-				svg.appendChild(S('rect', { x: X(r.ts) - 1.5, y: mt + ph - 8, width: 3, height: 8,
-					fill: r.status === 'skipped' ? '#999' : C.bad }));
+			if (r.status === 'error')        /* failed: red triangle */
+				svg.appendChild(S('path', { d: 'M%f,%fl5,9h-10z'.format(X(r.ts), mt + ph - 10), fill: C.bad }));
+			else if (r.status === 'skipped') /* skipped: hollow grey circle */
+				svg.appendChild(S('circle', { cx: X(r.ts), cy: mt + ph - 5, r: 3.5, fill: 'none', stroke: '#888', 'stroke-width': 1.5 }));
 		});
 
 	/* hover */
@@ -279,6 +286,9 @@ function lineChart(opts) {
 		dots.forEach(function(d) { d.setAttribute('visibility', 'hidden'); });
 	}
 
+	var current = -1;
+	var live = E('div', { 'class': 'ispy-sr', 'aria-live': 'polite' });
+
 	function show(ev) {
 		if (!rows.length) return;
 		var rect = svg.getBoundingClientRect();
@@ -286,7 +296,13 @@ function lineChart(opts) {
 		var t = t0 + ((cx - rect.left) * W / rect.width - ml) / pw * (t1 - t0);
 		var lo = 0, hi = rows.length - 1;
 		while (hi - lo > 1) { var mid = (lo + hi) >> 1; if (rows[mid].ts < t) lo = mid; else hi = mid; }
-		var r = Math.abs(rows[lo].ts - t) < Math.abs(rows[hi].ts - t) ? rows[lo] : rows[hi];
+		showIndex(Math.abs(rows[lo].ts - t) < Math.abs(rows[hi].ts - t) ? lo : hi, false);
+	}
+
+	function showIndex(idx, announce) {
+		current = idx;
+		var r = rows[idx];
+		var rect = svg.getBoundingClientRect();
 		var x = X(r.ts);
 		cursor.setAttribute('x1', x); cursor.setAttribute('x2', x);
 		cursor.setAttribute('visibility', 'visible');
@@ -307,6 +323,8 @@ function lineChart(opts) {
 			lines.push(E('div', { 'style': 'opacity:.7' }, r.server));
 		dom.content(tip, lines);
 		tip.style.display = 'block';
+		if (announce)
+			live.textContent = lines.map(function(n) { return n.textContent.replace('● ', ''); }).join('. ');
 		var px = x / W * rect.width;
 		if (px > rect.width / 2) { tip.style.left = ''; tip.style.right = (rect.width - px + 12) + 'px'; }
 		else { tip.style.right = ''; tip.style.left = (px + 12) + 'px'; }
@@ -316,6 +334,25 @@ function lineChart(opts) {
 	overlay.addEventListener('touchstart', show, { passive: true });
 	overlay.addEventListener('touchmove', show, { passive: true });
 	overlay.addEventListener('mouseleave', hide);
+
+	/* keyboard: arrows step through tests, PgUp/PgDn by 24, Home/End, Esc hides */
+	svg.addEventListener('keydown', function(ev) {
+		var n = rows.length, i = current < 0 ? n - 1 : current, step = current < 0 ? 0 : 1;
+		switch (ev.key) {
+		case 'ArrowLeft': i = Math.max(0, i - step); break;
+		case 'ArrowRight': i = Math.min(n - 1, i + step); break;
+		case 'PageUp': i = Math.max(0, i - 24); break;
+		case 'PageDown': i = Math.min(n - 1, i + 24); break;
+		case 'Home': i = 0; break;
+		case 'End': i = n - 1; break;
+		case 'Escape': hide(); current = -1; return;
+		default: return;
+		}
+		ev.preventDefault();
+		showIndex(i, true);
+	});
+	svg.addEventListener('blur', function() { hide(); current = -1; });
+	wrap.appendChild(live);
 
 	return wrap;
 }
@@ -395,7 +432,15 @@ function heatmap(rows) {
 	});
 	for (var h2 = 0; h2 < 24; h2 += 3)
 		svg.appendChild(S('text', { x: ml + h2 * cw + cw / 2, y: H - 6, 'text-anchor': 'middle' }, [ '%02d'.format(h2) ]));
-	return E('div', { 'class': 'ispy-chart' }, [ svg ]);
+	var loI = avgs.indexOf(lo), hiI = avgs.indexOf(hi);
+	var at = function(i) { return '%s %02d:00'.format(DAYS[Math.floor(i / 24)], i % 24); };
+	var summary = _('Slowest slot: %s (%s) · fastest: %s (%s).').format(at(loI), fmtMbps(lo), at(hiI), fmtMbps(hi));
+	svg.setAttribute('role', 'img');
+	svg.setAttribute('aria-label', _('Download speed by weekday and hour.') + ' ' + summary);
+	return E('div', {}, [
+		E('div', { 'class': 'ispy-chart' }, [ svg ]),
+		E('p', { 'class': 'ispy-muted' }, summary)
+	]);
 }
 
 function axisMbps(v) {
@@ -434,9 +479,9 @@ return view.extend({
 		this.status = data[0] || {};
 		this.wasRunning = !!this.status.running;
 
-		this.statusNode = E('div', { 'class': 'ispy-info' });
+		this.statusNode = E('div', { 'class': 'ispy-info', 'role': 'status', 'aria-live': 'polite' });
 		this.runBtn = E('button', { 'class': 'cbi-button cbi-button-action', 'click': ui.createHandlerFn(this, 'handleRun') }, _('Run test now'));
-		this.rangeNode = E('div', { 'class': 'ispy-ranges' });
+		this.rangeNode = E('div', { 'class': 'ispy-ranges', 'role': 'group', 'aria-label': _('Time range') });
 		this.body = E('div');
 
 		var root = E('div', { 'class': 'cbi-map' }, [
@@ -467,6 +512,7 @@ return view.extend({
 		dom.content(this.rangeNode, RANGES.map(L.bind(function(r) {
 			return E('button', {
 				'class': r[0] === this.range ? 'active' : '',
+				'aria-pressed': r[0] === this.range ? 'true' : 'false',
 				'click': ui.createHandlerFn(this, 'setRange', r[0])
 			}, r[1]);
 		}, this)));
@@ -498,6 +544,7 @@ return view.extend({
 		}
 		dom.content(this.statusNode, parts);
 		this.runBtn.disabled = !!st.running;
+		this.runBtn.textContent = st.running ? _('Testing…') : _('Run test now');
 	},
 
 	pollStatus: function() {
@@ -613,17 +660,20 @@ return view.extend({
 		var sUp = { label: _('Upload'), color: C.up, get: function(r) { return r.up } };
 		var tput = lineChart({
 			rows: rows, t0: t0, t1: t1, marks: true, height: 260,
+			label: sd ? _('Download speed over time: median %s, range %s to %s').format(fmtMbps(sd.median), fmtMbps(sd.min), fmtMbps(sd.max)) : _('Download speed over time'),
 			refs: split ? refs.slice(0, planDown ? 1 : 0) : refs,
 			fmt: fmtMbps, axisFmt: axisMbps,
 			series: split ? [ sDown ] : [ sDown, sUp ]
 		});
 		var upChart = split ? lineChart({
 			rows: rows, t0: t0, t1: t1, height: 170,
+			label: su ? _('Upload speed over time: median %s, range %s to %s').format(fmtMbps(su.median), fmtMbps(su.min), fmtMbps(su.max)) : _('Upload speed over time'),
 			refs: planUp ? [ { value: planUp, color: C.up } ] : [],
 			fmt: fmtMbps, axisFmt: axisMbps, series: [ sUp ]
 		}) : null;
 		var lat = lineChart({
 			rows: rows, t0: t0, t1: t1, height: 200,
+			label: sp ? _('Latency over time: idle median %s, under download load %s, under upload load %s').format(fmtMs(sp.median), fmtMs(sld && sld.median), fmtMs(slu && slu.median)) : _('Latency over time'),
 			fmt: fmtMs, axisFmt: function(v) { return Math.round(v) + '' },
 			series: [
 				{ label: _('Idle'), color: C.ping, get: function(r) { return r.ping } },
@@ -636,7 +686,8 @@ return view.extend({
 		if (!split) tputLegend.push({ label: _('Upload'), color: C.up });
 		if (planDown) tputLegend.push({ label: _('Plan ↓'), color: C.down, dash: true });
 		if (planUp && !split) tputLegend.push({ label: _('Plan ↑'), color: C.up, dash: true });
-		if (failed || skipped) tputLegend.push({ label: _('Failed / skipped test'), color: C.bad });
+		if (failed) tputLegend.push({ label: '▲ ' + _('Failed test'), color: C.bad, text: true });
+		if (skipped) tputLegend.push({ label: '○ ' + _('Skipped test'), color: '#888', text: true });
 
 		var hours = hourChart(ok);
 		var spanDays = (ok.length ? ok[ok.length - 1].ts - ok[0].ts : 0) / 86400;
