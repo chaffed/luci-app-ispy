@@ -221,7 +221,7 @@ ok('damaged file: explains and points to the CSV', /cannot be displayed/.test(p4
  * garbage. Every "%" in a formatted string must be %s, %d, %f, %h (with
  * zero padding or a precision) or a doubled "%%". */
 var views = path.join(PKG, 'htdocs/luci-static/resources/view/ispy');
-var sources = [ FILES.common, FILES.report, FILES.standalone ].concat(
+var sources = [ FILES.common, FILES.report, FILES.standalone, path.join(PKG, 'htdocs/luci-static/resources/ispy/gl.js') ].concat(
 	fs.readdirSync(views).map(function(f) { return path.join(views, f); }));
 var stray = [];
 sources.forEach(function(f) {
@@ -231,7 +231,7 @@ sources.forEach(function(f) {
 			stray.push(path.basename(f) + ':' + text.slice(0, m.index).split('\n').length);
 });
 ok('no formatted string has a "%" that LuCI would misread', stray.length === 0, stray.join(', '));
-ok('formatted strings were found to check (' + sources.length + ' files)', sources.length === 6);
+ok('formatted strings were found to check (' + sources.length + ' files)', sources.length === 7);
 
 console.log(fail ? fail + ' FAILED' : 'all passed');
 process.exit(fail ? 1 : 0);

@@ -5,7 +5,8 @@ speed tests on a schedule, shows what your ISP actually delivers and when, and
 produces a **printable report** comparing that with the advertised speed, for
 your provider's support team or a complaint to a regulator.
 It was built for the **GL.iNet GL-BE9300 (Flint 3)** but works on any OpenWrt
-21.02+ router with LuCI.
+21.02+ router with LuCI. On GL.iNet routers it also appears in GL's own admin
+panel, under **Applications → ISPy Speed Monitor**.
 
 ![ISPy dashboard (demo data)](docs/screenshot.png)
 <sub>Dashboard with 7 days of demo data.</sub>
@@ -22,6 +23,8 @@ It was built for the **GL.iNet GL-BE9300 (Flint 3)** but works on any OpenWrt
   an A+…F bufferbloat grade, speed by hour of day, a weekday × hour heatmap,
   and statistics for every metric. Hover or use the arrow keys on a chart.
 - **Report** for your ISP or a regulator (see below).
+- **Two places to use it**: LuCI, and on GL.iNet routers the normal GL admin
+  panel, with the same pages and your usual login.
 - **Evidence recorded with every test**, not just a speed:
   - the total traffic on the WAN port while the test ran,
   - what else was using the connection just before it,
@@ -154,12 +157,31 @@ ssh root@192.168.8.1 'opkg update && opkg install /tmp/luci-app-ispy_*_all.ipk'
 
 (`-O` makes `scp` use the legacy protocol, because OpenWrt has no SFTP server by default.)
 
-Open **Services → ISPy Speed Monitor**. Scheduled testing starts enabled with a
-1-hour interval, and the first test runs about two minutes after install.
+Open **Services → ISPy Speed Monitor** in LuCI or, on GL.iNet firmware,
+**Applications → ISPy Speed Monitor** in the GL admin panel (see below).
+Scheduled testing starts enabled with a 1-hour interval, and the first test
+runs about two minutes after install.
 
 The package is architecture-independent (shell + JavaScript). It depends only
 on `luci-base`, `curl` and `jsonfilter`. Upgrading from 1.0 keeps your history;
 the results file gains new columns automatically.
+
+### In the GL.iNet admin panel
+
+On GL.iNet firmware 4.x ISPy adds itself to GL's own admin panel
+(`http://192.168.8.1`), under **Applications → ISPy Speed Monitor**, with the
+same Overview, Report and Settings pages as in LuCI. It uses your normal
+panel login; LuCI only has to be installed, not opened. Checked on a
+GL-BE9300 with firmware 4.10.1.
+
+How it fits in, for the curious: the panel loads ISPy's page
+(`/www/views/gl-sdk4-ui-ispy.common.js`) like its own plugins and shows
+ISPy in a frame of its own, so ISPy's styles and scripts cannot affect the
+panel; the frame follows the panel's light or dark theme. The page talks to
+the router only through the panel's login-checked API, via a small module
+(`/usr/lib/oui-httpd/rpc/ispy`) that checks every setting before storing it.
+GL.iNet does not document this plugin interface, so a future firmware
+version could change it; LuCI keeps working either way.
 
 ### Optional: Ookla speedtest CLI
 
@@ -282,12 +304,14 @@ Log messages go to the system log: `logread -e ispy`.
 | Report document | `/www/luci-static/resources/ispy/report.js` |
 | Page and script of the report file saved to a drive | `/usr/share/ispy/standalone.{html,js}` |
 | Views | `/www/luci-static/resources/view/ispy/{overview,report,settings}.js` |
+| GL.iNet admin panel: page, script, API module, menu entry | `/www/views/gl-sdk4-ui-ispy.common.js`, `/www/luci-static/resources/ispy/gl.js`, `/usr/lib/oui-httpd/rpc/ispy`, `/usr/share/oui/menu.d/ispy.json` |
 
 ## Development
 
 ```sh
 node tests/analysis.test.js     # statistics behind the dashboard and report
 node tests/report.test.js       # the report file saved to a USB drive
+lua tests/gl_rpc.test.lua       # the GL admin panel module (Lua 5.1 + lua-cjson)
 scripts/build-ipk.sh            # -> dist/luci-app-ispy_<ver>_all.ipk (Linux or macOS)
 ```
 

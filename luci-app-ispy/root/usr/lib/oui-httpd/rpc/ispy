@@ -1,0 +1,247 @@
+--[[
+    @object-name: ispy
+    @object-desc: ISPy speed monitor (luci-app-ispy) for the GL.iNet admin panel.
+
+    The panel only lets a logged-in administrator call these methods. They
+    run /usr/bin/ispy without a shell (arguments are passed as a list) and
+    read or write the "ispy" UCI section. Every setting is checked here
+    before it is stored; /usr/bin/ispy checks them again when it uses them.
+
+    SPDX-License-Identifier: MIT
+--]]
+
+local cjson = require "cjson"
+local uci = require "uci"
+
+local M = {}
+
+local ISPY = "/usr/bin/ispy"
+
+-- Run /usr/bin/ispy with fixed arguments and return what it printed.
+-- The panel's web server provides its own ngx.pipe (it hands the command to
+-- gl-ngx-session), which only knows spawn(args, opts), stdout_read_all()
+-- and wait(); the options below mean the same to OpenResty's ngx.pipe.
+local function ispy(args, seconds)
+    local cmd = { ISPY }
+    for _, a in ipairs(args) do cmd[#cmd + 1] = a end
+    local ms = (seconds or 30) * 1000
+    local proc = ngx.pipe.spawn(cmd, { stdout_read_timeout = ms, wait_timeout = ms })
+    if not proc then return "" end
+    local out = proc:stdout_read_all()
+    proc:wait()
+    return out or ""
+end
+
+local function ispy_json(args, seconds)
+    local ok, res = pcall(cjson.decode, ispy(args, seconds))
+    if ok and type(res) == "table" then return res end
+    return { err_code = -1, err_msg = "ISPy did not answer" }
+end
+
+-- Whole number within [lo, hi], else the default.
+local function int_arg(v, lo, hi, default)
+    v = tonumber(v)
+    if not v or v ~= v then return default end
+    v = math.floor(v)
+    if v < lo then return lo end
+    if v > hi then return hi end
+    return v
+end
+
+--[[
+    @method-name: status
+    @method-desc: Scheduler state, last result and the copy on a USB drive.
+    @in-example:  {"jsonrpc":"2.0","method":"call","params":["","ispy","status",{}],"id":1}
+--]]
+M.status = function()
+    return ispy_json({ "status" })
+end
+
+--[[
+    @method-name: meta
+    @method-desc: Router and test setup, for the report.
+--]]
+M.meta = function()
+    return ispy_json({ "meta" })
+end
+
+--[[
+    @method-name: results
+    @method-desc: Stored results as CSV, oldest first.
+    @in number since   Unix time; only results from then on.
+    @in number limit   Rows per page (at most 5000).
+    @in number offset  Rows to skip.
+    @out string csv
+--]]
+M.results = function(params)
+    params = params or {}
+    return ispy_json({ "results-json",
+        tostring(int_arg(params.since, 0, 4294967295, 0)),
+        tostring(int_arg(params.limit, 1, 5000, 1500)),
+        tostring(int_arg(params.offset, 0, 10000000, 0)) }, 60)
+end
+
+--[[
+    @method-name: run
+    @method-desc: Start one test in the background.
+--]]
+M.run = function()
+    ispy({ "start" })
+    return { started = true }
+end
+
+--[[
+    @method-name: clear
+    @method-desc: Delete the stored results (a copy on a USB drive is kept).
+--]]
+M.clear = function()
+    ispy({ "clear" }, 60)
+    return { cleared = true }
+end
+
+--[[
+    @method-name: export
+    @method-desc: Save the results and the report to the USB drive now.
+--]]
+M.export = function()
+    ispy({ "export" }, 120)
+    return ispy_json({ "export-status" })
+end
+
+-- ------------------------------------------------------------- settings --
+
+local function is_uint(v) return v:match("^%d+$") ~= nil and #v <= 10 end
+local function is_ufloat(v) return v:match("^%d+%.?%d*$") ~= nil and #v <= 12 end
+
+local function range(lo, hi)
+    return function(v)
+        return is_uint(v) and tonumber(v) >= lo and tonumber(v) <= hi
+    end
+end
+
+-- Free text printed on the report: anything printable, one line.
+local function text(v)
+    return #v <= 120 and not v:find("[%z\1-\31\127]")
+end
+
+local function path(v)
+    return v:match("^/[%w%._/%-]*$") ~= nil and not v:find("%.%.") and #v <= 200
+end
+
+-- Every setting the panel may change, with the check its value must pass.
+-- "optional" settings are removed when left empty.
+local FIELDS = {
+    enabled = { check = function(v) return v == "0" or v == "1" end },
+    interval = { check = range(5, 10080) },
+    busy_threshold = { check = is_ufloat },
+    backend = { check = function(v)
+        return v == "auto" or v == "cloudflare" or v == "ookla" or v == "librespeed"
+    end },
+    interface = { optional = true, check = function(v)
+        return v:match("^[%w%._%-]+$") ~= nil and #v <= 32
+    end },
+    streams = { check = range(1, 16) },
+    duration = { check = range(5, 60) },
+    ping_host = { check = function(v)
+        return v:match("^[%w%.:_%-]+$") ~= nil and v:sub(1, 1) ~= "-" and #v <= 253
+    end },
+    ping_count = { check = range(1, 50) },
+    ookla_server = { optional = true, check = is_uint },
+    librespeed_server = { optional = true, check = is_uint },
+    plan_down = { optional = true, check = is_ufloat },
+    plan_up = { optional = true, check = is_ufloat },
+    isp_name = { optional = true, check = text },
+    plan_name = { optional = true, check = text },
+    subscriber = { optional = true, check = text },
+    account = { optional = true, check = text },
+    service_address = { optional = true, check = text },
+    results_file = { check = function(v) return path(v) and v:match("%.csv$") ~= nil end },
+    max_results = { check = range(100, 50000) },
+    export_dir = { optional = true, check = function(v) return path(v) and v ~= "/" end },
+}
+
+M.FIELDS = FIELDS
+
+local function networks(c)
+    local list = {}
+    c:foreach("network", "interface", function(s)
+        local name = s[".name"]
+        if name ~= "loopback" and s.proto ~= "none" then list[#list + 1] = name end
+    end)
+    table.sort(list)
+    return list
+end
+
+--[[
+    @method-name: get_config
+    @method-desc: Current settings, and the network interfaces a test can use.
+    @out object config
+    @out array networks
+--]]
+M.get_config = function()
+    local c = uci.cursor()
+    local config = {}
+    for key in pairs(FIELDS) do
+        local v = c:get("ispy", "main", key)
+        if type(v) == "string" then config[key] = v end
+    end
+    return { config = config, networks = networks(c) }
+end
+
+--[[
+    @method-name: set_config
+    @method-desc: Check and store settings. Nothing is stored unless every value is valid.
+    @in object values  setting -> value (strings, numbers or booleans)
+    @out bool saved
+--]]
+M.set_config = function(params)
+    local values = type(params) == "table" and params.values
+    if type(values) ~= "table" then
+        return { err_code = -1, err_msg = "no settings were sent" }
+    end
+
+    local changes = {}
+    for key, v in pairs(values) do
+        local field = type(key) == "string" and FIELDS[key]
+        if not field then
+            return { err_code = -1, err_msg = "unknown setting", field = tostring(key) }
+        end
+        if type(v) == "boolean" then
+            v = v and "1" or "0"
+        elseif type(v) == "number" then
+            -- "%.0f", not "%d": the panel's Lua may use 32-bit integers.
+            v = (v == math.floor(v)) and string.format("%.0f", v) or tostring(v)
+        elseif type(v) ~= "string" then
+            return { err_code = -1, err_msg = "invalid value", field = key }
+        end
+        v = v:match("^%s*(.-)%s*$")
+        if v == "" then
+            if not field.optional then
+                return { err_code = -1, err_msg = "this setting cannot be empty", field = key }
+            end
+            changes[key] = false
+        elseif not field.check(v) then
+            return { err_code = -1, err_msg = "invalid value", field = key }
+        else
+            changes[key] = v
+        end
+    end
+
+    local c = uci.cursor()
+    if not c:get("ispy", "main") then
+        c:set("ispy", "main", "ispy")
+    end
+    for key, v in pairs(changes) do
+        if v == false then
+            c:delete("ispy", "main", key)
+        else
+            c:set("ispy", "main", key, v)
+        end
+    end
+    c:commit("ispy")
+    -- The scheduler reads its settings again at least once a minute, so it
+    -- is not restarted here (that would abort a test in progress).
+    return { saved = true }
+end
+
+return M

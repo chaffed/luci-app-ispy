@@ -13,6 +13,13 @@ if [ -f /var/run/config.md5 ] && ! grep -q '/var/run/config.check/ispy$' /var/ru
 	rm -rf /var/run/config.check
 fi
 
+# GL.iNet admin panel: its web server keeps a panel module in memory once
+# it has been used, so reload it (gracefully: open pages are not cut off)
+# to pick up a new version of ISPy's (/usr/lib/oui-httpd/rpc/ispy).
+if [ -d /usr/lib/oui-httpd/rpc ] && [ -s /var/run/nginx.pid ] && [ -x /usr/sbin/nginx ]; then
+	/usr/sbin/nginx -s reload 2>/dev/null
+fi
+
 /etc/init.d/ispy enable 2>/dev/null
 /etc/init.d/ispy restart 2>/dev/null
 exit 0

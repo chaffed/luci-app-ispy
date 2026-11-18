@@ -25,10 +25,10 @@ jobs:
 
       - name: Check JavaScript syntax and JSON
         run: |
-          for f in luci-app-ispy/htdocs/luci-static/resources/view/ispy/*.js luci-app-ispy/htdocs/luci-static/resources/ispy/*.js luci-app-ispy/root/usr/share/ispy/*.js; do
+          for f in luci-app-ispy/htdocs/luci-static/resources/view/ispy/*.js luci-app-ispy/htdocs/luci-static/resources/ispy/*.js luci-app-ispy/root/usr/share/ispy/*.js luci-app-ispy/htdocs/views/*.js; do
             node -e "new Function(require('fs').readFileSync('$f', 'utf8'))"
           done
-          for f in luci-app-ispy/root/usr/share/luci/menu.d/*.json luci-app-ispy/root/usr/share/rpcd/acl.d/*.json; do
+          for f in luci-app-ispy/root/usr/share/luci/menu.d/*.json luci-app-ispy/root/usr/share/rpcd/acl.d/*.json luci-app-ispy/root/usr/share/oui/menu.d/*.json luci-app-ispy/htdocs/i18n/*.json; do
             python3 -m json.tool "$f" > /dev/null
           done
 
@@ -37,6 +37,12 @@ jobs:
 
       - name: Test the report file saved to a USB drive
         run: node tests/report.test.js
+
+      - name: Test the GL.iNet admin panel module
+        run: |
+          sudo apt-get install -y -qq lua5.1 lua-cjson >/dev/null
+          luac5.1 -p luci-app-ispy/root/usr/lib/oui-httpd/rpc/ispy luci-app-ispy/root/usr/share/gl-validator.d/ispy.lua
+          lua5.1 tests/gl_rpc.test.lua
 
       - name: Build ipk
         run: scripts/build-ipk.sh dist
