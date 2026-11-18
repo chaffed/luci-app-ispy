@@ -25,12 +25,15 @@ jobs:
 
       - name: Check JavaScript syntax and JSON
         run: |
-          for f in luci-app-ispy/htdocs/luci-static/resources/view/ispy/*.js; do
+          for f in luci-app-ispy/htdocs/luci-static/resources/view/ispy/*.js luci-app-ispy/htdocs/luci-static/resources/ispy/*.js; do
             node -e "new Function(require('fs').readFileSync('$f', 'utf8'))"
           done
           for f in luci-app-ispy/root/usr/share/luci/menu.d/*.json luci-app-ispy/root/usr/share/rpcd/acl.d/*.json; do
             python3 -m json.tool "$f" > /dev/null
           done
+
+      - name: Test the statistics behind the dashboard and report
+        run: node tests/analysis.test.js
 
       - name: Build ipk
         run: scripts/build-ipk.sh dist

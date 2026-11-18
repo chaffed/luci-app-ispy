@@ -38,9 +38,10 @@ License: MIT
 Section: luci
 Architecture: all
 Installed-Size: $((SIZE * 1024))
-Description: ISPy - scheduled speed tests with statistics and graphs.
- Runs internet speed tests on a schedule and shows throughput, latency,
- bufferbloat and time-of-day statistics in LuCI.
+Description: ISPy - scheduled speed tests with statistics, graphs and a report.
+ Runs internet speed tests on a schedule, shows throughput, latency,
+ bufferbloat and time-of-day statistics in LuCI, and builds a printable
+ report comparing measured with advertised speeds.
 CTRL
 echo "/etc/config/ispy" > "$WORK/control/conffiles"
 

@@ -3,15 +3,27 @@
 		"description": "Grant access to ISPy speed monitor",
 		"read": {
 			"ubus": {
-				"luci.ispy": [ "status", "results" ]
+				"luci.ispy": [
+					"status",
+					"meta",
+					"results"
+				]
 			},
-			"uci": [ "ispy", "network" ]
+			"uci": [
+				"ispy",
+				"network"
+			]
 		},
 		"write": {
 			"ubus": {
-				"luci.ispy": [ "run", "clear" ]
+				"luci.ispy": [
+					"run",
+					"clear"
+				]
 			},
-			"uci": [ "ispy" ]
+			"uci": [
+				"ispy"
+			]
 		}
 	}
 }

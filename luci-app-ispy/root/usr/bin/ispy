@@ -9,18 +9,30 @@
 #   start               run one test in the background (used by LuCI)
 #   daemon              scheduler loop (started by /etc/init.d/ispy)
 #   status              print scheduler / last-result status as JSON
-#   results [since] [limit]
-#                       print stored results as CSV (newest last)
-#   results-json [since] [limit]
+#   meta                print router / test setup details as JSON
+#   results [since] [limit] [offset]
+#                       print stored results as CSV (oldest first)
+#   results-json [since] [limit] [offset]
 #                       same, wrapped as {"csv": "..."} for rpcd
 #   clear               delete all stored results
 #   backends            list speed test backends usable on this router
 #
 # SPDX-License-Identifier: MIT
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 RUNDIR=/var/run/ispy
-HEADER="ts,backend,server,ping_ms,jitter_ms,loss_pct,loaded_down_ms,loaded_up_ms,down_mbps,up_mbps,bytes,status,message"
+
+# One row per test. Columns after "message" are measurement controls:
+#   wan_*_mbps  total throughput on the WAN device while the test saturated
+#               the line (test traffic + anything else using the connection)
+#   bg_*_mbps   traffic already on the WAN device just before the test
+#   cpu_*_pct   load of the busiest CPU core during the phase
+#   link_mbps   negotiated speed of the WAN port
+#   dev         WAN device the test ran over
+HEADER="ts,backend,server,ping_ms,jitter_ms,loss_pct,loaded_down_ms,loaded_up_ms,down_mbps,up_mbps,bytes,status,message,wan_down_mbps,wan_up_mbps,bg_down_mbps,bg_up_mbps,cpu_down_pct,cpu_up_pct,link_mbps,dev"
+
+DEFAULT_RESULTS=/etc/ispy/results.csv
+DEFAULT_CF_URL=https://speed.cloudflare.com
 
 [ -f /lib/functions.sh ] && . /lib/functions.sh
 
@@ -36,10 +48,10 @@ load_config() {
 	config_get PING_HOST main ping_host 1.1.1.1
 	config_get PING_COUNT main ping_count 10
 	config_get IFACE main interface ''
-	config_get RESULTS main results_file /etc/ispy/results.csv
+	config_get RESULTS main results_file "$DEFAULT_RESULTS"
 	config_get MAX_RESULTS main max_results 4000
 	config_get BUSY main busy_threshold 0
-	config_get CF_URL main cf_url https://speed.cloudflare.com
+	config_get CF_URL main cf_url "$DEFAULT_CF_URL"
 	config_get OOKLA_SERVER main ookla_server ''
 	config_get LIBRESPEED_SERVER main librespeed_server ''
 
@@ -49,13 +61,28 @@ load_config() {
 	case "$DURATION" in ''|*[!0-9]*) DURATION=10 ;; esac
 	case "$PING_COUNT" in ''|*[!0-9]*) PING_COUNT=10 ;; esac
 	case "$MAX_RESULTS" in ''|*[!0-9]*) MAX_RESULTS=4000 ;; esac
-	case "$BUSY" in ''|*[!0-9.]*) BUSY=0 ;; esac
+	case "$BUSY" in ''|*[!0-9.]*|*.*.*) BUSY=0 ;; esac
 	[ "$INTERVAL" -lt 5 ] && INTERVAL=5
 	[ "$STREAMS" -lt 1 ] && STREAMS=1
 	[ "$STREAMS" -gt 16 ] && STREAMS=16
-	[ "$DURATION" -lt 3 ] && DURATION=3
+	[ "$DURATION" -lt 5 ] && DURATION=5
 	[ "$DURATION" -gt 60 ] && DURATION=60
 	[ "$PING_COUNT" -lt 1 ] && PING_COUNT=1
+	[ "$PING_COUNT" -gt 50 ] && PING_COUNT=50
+	[ "$MAX_RESULTS" -lt 100 ] && MAX_RESULTS=100
+
+	# These values end up in command lines and file operations run as root,
+	# so only accept what they are meant to be.
+	case "$BACKEND" in auto|cloudflare|ookla|librespeed) ;; *) BACKEND=auto ;; esac
+	case "$CF_URL" in http://*|https://*) ;; *) CF_URL=$DEFAULT_CF_URL ;; esac
+	case "$CF_URL" in *[!A-Za-z0-9.:/_-]*) CF_URL=$DEFAULT_CF_URL ;; esac
+	CF_URL=${CF_URL%/}
+	case "$PING_HOST" in ''|-*|*[!A-Za-z0-9.:_-]*) PING_HOST=1.1.1.1 ;; esac
+	case "$IFACE" in *[!A-Za-z0-9._-]*) IFACE='' ;; esac
+	case "$OOKLA_SERVER" in *[!0-9]*) OOKLA_SERVER='' ;; esac
+	case "$LIBRESPEED_SERVER" in *[!0-9]*) LIBRESPEED_SERVER='' ;; esac
+	case "$RESULTS" in /*.csv) ;; *) RESULTS=$DEFAULT_RESULTS ;; esac
+	case "$RESULTS" in *..*|*[!A-Za-z0-9._/-]*) RESULTS=$DEFAULT_RESULTS ;; esac
 	return 0
 }
 
@@ -63,10 +90,19 @@ load_config() {
 
 now() { date +%s; }
 
+# Monotonic clock from /proc/uptime: whole seconds, and centiseconds for
+# sub-second test timing (the wall clock may jump when NTP syncs).
+uptime_s() { local u; read -r u _ < /proc/uptime; echo "${u%.*}"; }
+upcs() { local u; read -r u _ < /proc/uptime; echo "${u%.*}${u#*.}"; }
+cs2s() { printf '%d.%02d' $(( $1 / 100 )) $(( $1 % 100 )); }
+
+# Interruptible sleep (lets signal traps run straight away).
+nap() { sleep "$1" & SLEEP_PID=$!; wait "$SLEEP_PID"; }
+
 # Integer or 0 (safe for shell arithmetic).
 int0() { case "$1" in ''|*[!0-9]*) echo 0 ;; *) echo "$1" ;; esac; }
 
-# Linux device used for the test (and for the "line busy" check).
+# Linux device used for the test (and for WAN traffic accounting).
 wan_device() {
 	local dev=""
 	if [ -n "$IFACE" ]; then
@@ -77,19 +113,49 @@ wan_device() {
 		# Interface carrying the IPv4 default route.
 		dev=$(awk '$2 == "00000000" && $8 == "00000000" { print $1; exit }' /proc/net/route 2>/dev/null)
 	fi
+	case "$dev" in *[!A-Za-z0-9._@-]*) dev="" ;; esac
 	echo "$dev"
 }
 
-# Strip characters that would break the CSV / JSON encoding.
-clean() { printf '%s' "$*" | tr -d '\r\n",\\' | cut -c1-120; }
+# Negotiated speed (Mbit/s) of the port behind a WAN device, if it has one.
+link_speed() { # $1=device
+	local s phys
+	[ -n "$1" ] || return 0
+	s=$(cat "/sys/class/net/$1/speed" 2>/dev/null)
+	if ! [ "${s:-0}" -gt 0 ] 2>/dev/null; then
+		# e.g. pppoe-wan: look at the port the tunnel runs over.
+		phys=$(ubus call network.interface dump 2>/dev/null |
+			jsonfilter -e "@.interface[@.l3_device='$1'].device" 2>/dev/null | head -n1)
+		case "$phys" in ''|*[!A-Za-z0-9._@-]*) return 0 ;; esac
+		s=$(cat "/sys/class/net/$phys/speed" 2>/dev/null)
+	fi
+	[ "${s:-0}" -gt 0 ] 2>/dev/null && echo "$s"
+}
+
+# Strip characters that would break the CSV / JSON encoding or could be
+# interpreted as markup by a careless consumer.
+clean() { printf '%s' "$*" | tr -d '\000-\037",\\<>' | cut -c1-120; }
 
 set_phase() { mkdir -p "$RUNDIR"; echo "$1" > "$RUNDIR/phase"; }
+
+# The router has no battery-backed clock: right after boot the time is wrong
+# until NTP syncs, and a test stamped with the wrong time is worthless as a
+# record. The ntp hotplug (shipped with dnsmasq) leaves a flag once the time
+# is valid; without that flag, give NTP ten minutes.
+time_synced() {
+	[ -e /var/state/dnsmasqsec ] && return 0
+	[ "$(uptime_s)" -ge 600 ]
+}
 
 backend_available() {
 	case "$1" in
 		cloudflare) command -v curl >/dev/null 2>&1 ;;
-		ookla) command -v speedtest >/dev/null 2>&1 &&
-			speedtest --version 2>/dev/null | grep -qi ookla ;;
+		ookla)
+			command -v speedtest >/dev/null 2>&1 || { rm -f "$RUNDIR/ookla.ok"; return 1; }
+			[ -e "$RUNDIR/ookla.ok" ] && return 0
+			speedtest --version 2>/dev/null | grep -qi ookla || return 1
+			mkdir -p "$RUNDIR" && : > "$RUNDIR/ookla.ok"
+			;;
 		librespeed) command -v librespeed-cli >/dev/null 2>&1 ;;
 		*) return 1 ;;
 	esac
@@ -107,7 +173,7 @@ resolve_backend() {
 }
 
 # Parse busybox/iputils ping output: prints "avg jitter loss" (avg/jitter
-# may be "-" when nothing came back).
+# are "-" when nothing came back).
 ping_stats() {
 	awk -v sent="$2" '
 		/time[=<]/ {
@@ -122,14 +188,12 @@ ping_stats() {
 			if (n == 0) { printf "- - 100\n"; exit }
 			loss = (sent - n) * 100 / sent; if (loss < 0) loss = 0
 			printf "%.2f %.2f %.1f\n", s / n, (n > 1 ? j / (n - 1) : 0), loss
-		}' "$1"
+		}' "$1" 2>/dev/null || echo "- - 100"
 }
 
 ping_cmd() { # $1=count $2=outfile
-	local dev
-	dev=$(wan_device)
-	if [ -n "$IFACE" ] && [ -n "$dev" ]; then
-		ping -c "$1" -W 2 -I "$dev" "$PING_HOST" > "$2" 2>/dev/null
+	if [ -n "$IFACE" ] && [ -n "$WAN_DEV" ]; then
+		ping -c "$1" -W 2 -I "$WAN_DEV" "$PING_HOST" > "$2" 2>/dev/null
 	else
 		ping -c "$1" -W 2 "$PING_HOST" > "$2" 2>/dev/null
 	fi
@@ -137,150 +201,252 @@ ping_cmd() { # $1=count $2=outfile
 
 # Current WAN throughput (Mbit/s, rx+tx) averaged over 3 seconds.
 wan_load_mbps() {
-	local dev rx1 tx1 rx2 tx2
-	dev=$(wan_device)
-	[ -n "$dev" ] && [ -r "/sys/class/net/$dev/statistics/rx_bytes" ] || { echo 0; return; }
-	rx1=$(cat "/sys/class/net/$dev/statistics/rx_bytes"); tx1=$(cat "/sys/class/net/$dev/statistics/tx_bytes")
-	sleep 3
-	rx2=$(cat "/sys/class/net/$dev/statistics/rx_bytes"); tx2=$(cat "/sys/class/net/$dev/statistics/tx_bytes")
+	local d="/sys/class/net/$WAN_DEV/statistics" rx1 tx1 rx2 tx2
+	[ -n "$WAN_DEV" ] && [ -r "$d/rx_bytes" ] || { echo 0; return; }
+	read -r rx1 < "$d/rx_bytes"; read -r tx1 < "$d/tx_bytes"
+	nap 3
+	read -r rx2 < "$d/rx_bytes"; read -r tx2 < "$d/tx_bytes"
 	awk -v a="$rx1" -v b="$tx1" -v c="$rx2" -v d="$tx2" 'BEGIN { printf "%.1f\n", ((c - a) + (d - b)) * 8 / 3 / 1000000 }'
 }
 
-# --------------------------------------------------------------- backends --
-# Each backend sets: R_SERVER R_PING R_JITTER R_LOSS R_LOADED_DOWN R_LOADED_UP
-# R_DOWN R_UP R_BYTES and returns non-zero (with R_ERROR set) on failure.
+# ----------------------------------------------------- WAN / CPU sampling --
+# While a test runs, a sampler logs the WAN device's byte counters and the
+# per-core CPU counters once a second:
+#   uptime_cs rx_bytes tx_bytes [busy_jiffies total_jiffies]...   (per core)
+# The counters see everything crossing the WAN device, so they give the
+# line's total throughput even when other devices are using the connection,
+# and they show whether the router itself was the bottleneck.
 
-# speed.cloudflare.com refuses (403) single downloads of >= 100 MB.
-CF_CHUNK=25000000
-CF_MAXREQ=20
-CF_WFMT='%{http_code} %{size_download} %{size_upload} %{time_pretransfer} %{time_total}\n'
-
-cf_curl_iface() {
-	local dev
-	if [ -n "$IFACE" ]; then
-		dev=$(wan_device)
-		[ -n "$dev" ] && echo "--interface $dev"
-	fi
-}
-
-# One download or upload stream that keeps a connection busy until the
-# deadline. Appends "http_code bytes_down bytes_up t_pretransfer t_total"
-# for every transfer (curl reports partial counts for timed-out transfers).
-cf_stream() { # $1=down|up $2=deadline $3=outfile
-	local mode="$1" deadline="$2" out="$3" left n=1 i args iface
-	iface=$(cf_curl_iface)
+sampler() {
+	local d="/sys/class/net/$WAN_DEV/statistics" u rx tx
 	while :; do
-		left=$(( deadline - $(now) ))
-		[ "$left" -ge 1 ] || break
-		# -k: only throwaway test data is exchanged, and some firmwares
-		# ship without a CA bundle.
-		if [ "$mode" = up ]; then
-			# One chunked POST streamed from /dev/zero, cut off at the deadline.
-			head -c 4000000000 /dev/zero |
-				curl -s -k $iface --connect-timeout 5 --max-time "$left" \
-					-X POST -H 'Content-Type: application/octet-stream' -H 'Expect:' \
-					-T - -o /dev/null -w "$CF_WFMT" "$CF_URL/__up" >> "$out" 2>/dev/null
-			break
-		fi
-		# Queue as many 25 MB requests on one connection as should fit in the
-		# remaining time (based on the previous rate), so we overrun the
-		# deadline by at most one chunk. --max-time applies per transfer.
-		args=""
-		i=0
-		while [ "$i" -lt "$n" ]; do
-			args="$args -o /dev/null $CF_URL/__down?bytes=$CF_CHUNK"
-			i=$((i + 1))
-		done
-		curl -s -k $iface --connect-timeout 5 --max-time "$left" \
-			-w "$CF_WFMT" $args >> "$out" 2>/dev/null
-		# Stop on HTTP errors (e.g. 429 rate limiting) or a dead connection.
-		tail -n1 "$out" 2>/dev/null | awk '{ exit !($1 == 200 && $2 > 0) }' || break
-		n=$(awk -v l="$(( deadline - $(now) ))" -v c="$CF_CHUNK" -v m="$CF_MAXREQ" '
-			$1 == 200 { b += $2; t += $5 - $4 }
-			END { if (t <= 0) t = 0.001; n = int(l * b / t / c) + 1; if (n > m) n = m; print n }' "$out")
+		rx=-1; tx=-1
+		[ -n "$WAN_DEV" ] && [ -r "$d/rx_bytes" ] && { read -r rx < "$d/rx_bytes"; read -r tx < "$d/tx_bytes"; }
+		read -r u _ < /proc/uptime
+		echo "${u%.*}${u#*.} $rx $tx $(awk '/^cpu[0-9]/ { printf "%.0f %.0f ", $2+$3+$4+$7+$8+$9, $2+$3+$4+$5+$6+$7+$8+$9 }' /proc/stat)" >> "$TMPD/samples"
+		sleep 1
 	done
 }
 
-# Sum of per-stream rates. Prints "mbps bytes worst_http_code".
-cf_aggregate() { # $1=down|up $2..=files
-	local col=2
-	[ "$1" = up ] && col=3
-	shift
-	awk -v c="$col" '
-		FNR == 1 { f++ }
-		{
-			tot += $c
-			if ($1 != 200 && $1 != 100 && $1 != 0) bad = $1
-			if ($c > 0 && $5 > $4) { b[f] += $c; t[f] += $5 - $4 }
+# Averages between two points in time (uptime centiseconds).
+# Prints "rx_mbps tx_mbps busiest_core_pct", "-" where unknown.
+window_metrics() { # $1=from $2=to
+	awk -v a="$1" -v b="$2" '
+		$1 >= a && $1 <= b {
+			if (!n++) { t0 = $1; r0 = $2; x0 = $3; for (i = 4; i <= NF; i++) c0[i] = $i }
+			t1 = $1; r1 = $2; x1 = $3; nf = NF
+			for (i = 4; i <= NF; i++) c1[i] = $i
 		}
 		END {
-			for (i = 1; i <= f; i++) if (t[i] > 0) mbps += b[i] * 8 / t[i] / 1000000
-			printf "%.2f %d %d\n", mbps, tot, bad
+			if (n < 2 || t1 - t0 < 100) { print "- - -"; exit }
+			s = (t1 - t0) / 100
+			rx = (r0 >= 0 && r1 >= r0) ? sprintf("%.2f", (r1 - r0) * 8 / s / 1000000) : "-"
+			tx = (x0 >= 0 && x1 >= x0) ? sprintf("%.2f", (x1 - x0) * 8 / s / 1000000) : "-"
+			m = -1
+			for (i = 4; i < nf; i += 2) {
+				d = c1[i + 1] - c0[i + 1]
+				if (d > 0) { p = (c1[i] - c0[i]) * 100 / d; if (p > m) m = p }
+			}
+			print rx, tx, (m >= 0 ? sprintf("%.0f", m) : "-")
+		}' "$TMPD/samples" 2>/dev/null || echo "- - -"
+}
+
+# --------------------------------------------------------------- backends --
+# Each backend sets the R_* result variables and returns non-zero (with
+# R_ERROR set) when the test is not a valid measurement.
+
+# speed.cloudflare.com refuses (403) single downloads of >= 100 MB, so a
+# stream downloads 25 MB objects back to back over one connection.
+CF_CHUNK=25000000
+CF_QUEUE=40
+# http_code size_download size_upload t_pretransfer t_starttransfer t_total
+CF_WFMT='%{http_code} %{size_download} %{size_upload} %{time_pretransfer} %{time_starttransfer} %{time_total}\n'
+
+# Verify TLS when the firmware has a CA bundle; test data is throwaway, but
+# the server's identity is part of what makes a measurement trustworthy.
+CURL_TLS=""
+[ -s /etc/ssl/certs/ca-certificates.crt ] || [ -s /etc/ssl/cert.pem ] || CURL_TLS="-k"
+
+cf_curl_iface() { [ -n "$IFACE" ] && [ -n "$WAN_DEV" ] && echo "--interface $WAN_DEV"; }
+
+# One download or upload stream that keeps a connection busy until the
+# deadline. curl reports every transfer on stderr (unbuffered, so nothing is
+# lost when a download is stopped), including partial ones cut by --max-time.
+cf_stream() { # $1=down|up $2=deadline (uptime cs) $3=stream number
+	local mode="$1" deadline="$2" out="$TMPD/$1.$3" pidf="$TMPD/pid.$1.$3" left i=0 args="" iface
+	iface=$(cf_curl_iface)
+	while [ "$i" -lt "$CF_QUEUE" ]; do
+		args="$args -o /dev/null $CF_URL/__down?bytes=$CF_CHUNK"
+		i=$((i + 1))
+	done
+	while :; do
+		left=$(( deadline - $(upcs) ))
+		[ "$left" -ge 30 ] || break
+		if [ "$mode" = up ]; then
+			# One chunked POST fed from /dev/zero through a FIFO. At the
+			# deadline cf_phase stops the feeder, not curl: curl then ends
+			# the request normally, so its byte count and duration only
+			# cover data the server has confirmed. (Aborting curl instead
+			# would count data still queued in this router as uploaded.)
+			mkfifo "$TMPD/fifo.$3" 2>/dev/null
+			dd if=/dev/zero bs=65536 2>/dev/null > "$TMPD/fifo.$3" &
+			echo $! > "$pidf"
+			curl -4 -s -f $CURL_TLS $iface --connect-timeout 5 --max-time "$(cs2s $(( left + 1000 )))" \
+				-X POST -H 'Content-Type: application/octet-stream' -H 'Expect:' \
+				-T - -o /dev/null -w "%{stderr}$CF_WFMT" "$CF_URL/__up" < "$TMPD/fifo.$3" 2>> "$out"
+			kill "$(cat "$pidf")" 2>/dev/null
+			break
+		else
+			# --fail-early: stop at the first HTTP error (e.g. 429) or timeout
+			# instead of working through the rest of the queue.
+			curl -4 -s -f --fail-early $CURL_TLS $iface --connect-timeout 5 --max-time "$(cs2s "$left")" \
+				-w "%{stderr}$CF_WFMT" $args 2>> "$out" &
+		fi
+		echo $! > "$pidf"
+		wait $!
+		tail -n1 "$out" 2>/dev/null | awk '{ exit !($1 == 200 && $2 > 0) }' || break
+	done
+}
+
+# Throughput as measured by the test itself: per stream, payload bytes over
+# the time spent transferring them, summed over the streams.
+# Prints "mbps bytes first_bad_http_code".
+cf_aggregate() { # $1=down|up $2..=stream logs
+	local mode="$1"
+	shift
+	awk -v m="$mode" '
+		FNR == 1 { f++ }
+		{
+			if (m == "down") { ok = ($1 == 200); n = $2; t = $6 - $5 }
+			else { ok = ($1 == 200 || $1 == 100 || $1 == 0); n = $3; t = $6 - $4 }
+			if (!ok) { if (!bad) bad = $1; next }
+			if (n > 0 && t > 0) { b[f] += n; s[f] += t; tot += n }
+		}
+		END {
+			for (i = 1; i <= f; i++) if (s[i] > 0) mbps += b[i] * 8 / s[i] / 1000000
+			printf "%.2f %.0f %d\n", mbps, tot, bad
 		}' "$@"
 }
 
-cf_phase() { # $1=down|up -> echoes "mbps bytes worst_http_code"
-	local i=1 deadline pids="" ppid
-	deadline=$(( $(now) + DURATION ))
+# Runs one direction. Sets P_MBPS P_BYTES P_CODE (from the transfers) and
+# P_WAN P_CPU (from the WAN/CPU sampler, ramp-up excluded).
+cf_phase() { # $1=down|up
+	local i=1 pids="" pingpid wd t0 deadline ramp
+	t0=$(upcs)
+	deadline=$(( t0 + DURATION * 100 ))
 	# Latency under load (bufferbloat) is sampled while the streams run.
 	ping_cmd "$DURATION" "$TMPD/ping.$1" &
-	ppid=$!
+	pingpid=$!
 	while [ "$i" -le "$STREAMS" ]; do
 		: > "$TMPD/$1.$i"
-		cf_stream "$1" "$deadline" "$TMPD/$1.$i" &
+		# Streams wind down 0.3 s early so that a transfer cut short by
+		# curl's own timeout is reported before the hard stop below.
+		# (2>/dev/null: the shell's "Terminated" notices; curl's report
+		# goes to the stream log.)
+		cf_stream "$1" $(( deadline - 30 )) "$i" 2>/dev/null &
 		pids="$pids $!"
 		i=$((i + 1))
 	done
+	# At the deadline stop whatever each stream registered: the curl of a
+	# download, the feeder of an upload. Whole seconds only: busybox sleep
+	# may not take fractions.
+	(
+		sleep "$DURATION"
+		for i in "$TMPD/pid.$1".*; do kill "$(cat "$i" 2>/dev/null)" 2>/dev/null; done
+	) 2>/dev/null &
+	wd=$!
+	BG_PIDS="$pids $pingpid $wd"
 	wait $pids
-	kill "$ppid" 2>/dev/null
-	wait "$ppid" 2>/dev/null
-	cf_aggregate "$1" "$TMPD/$1".[0-9]*
+	kill "$wd" "$pingpid" 2>/dev/null
+	wait "$wd" "$pingpid" 2>/dev/null
+	BG_PIDS=""
+
+	set -- "$1" $(cf_aggregate "$1" "$TMPD/$1".[0-9]*)
+	P_MBPS=$2; P_BYTES=$3; P_CODE=$4
+	# Skip the TCP ramp-up (first fifth, at most 2 s) and the last half
+	# second, when the streams are winding down.
+	ramp=$(( DURATION * 20 )); [ "$ramp" -gt 200 ] && ramp=200
+	set -- "$1" $(window_metrics $(( t0 + ramp )) $(( deadline - 50 )))
+	if [ "$1" = down ]; then P_WAN=$2; else P_WAN=$3; fi
+	P_CPU=$4
 }
 
 backend_cloudflare() {
-	local colo d u code
+	local colo code rc a
 	R_SERVER="Cloudflare"
-	colo=$(curl -s -k --max-time 5 "$CF_URL/cdn-cgi/trace" 2>/dev/null | sed -n 's/^colo=//p')
+	colo=$(curl -4 -s $CURL_TLS --max-time 5 "$CF_URL/cdn-cgi/trace" 2>/dev/null)
+	rc=$?
+	if [ -z "$CURL_TLS" ] && { [ "$rc" = 60 ] || [ "$rc" = 77 ] || [ "$rc" = 35 ]; }; then
+		# Certificate check impossible on this firmware; carry on without.
+		CURL_TLS="-k"
+		colo=$(curl -4 -s -k --max-time 5 "$CF_URL/cdn-cgi/trace" 2>/dev/null)
+	fi
+	colo=$(echo "$colo" | sed -n 's/^colo=\([A-Za-z0-9]*\).*/\1/p')
 	[ -n "$colo" ] && R_SERVER="Cloudflare $colo"
 
+	# Idle latency; the same seconds measure what else is using the line.
 	set_phase ping
-	ping_cmd "$PING_COUNT" "$TMPD/ping.idle"
+	a=$(upcs)
+	ping_cmd "$PING_COUNT" "$TMPD/ping.idle" &
+	BG_PIDS=$!
+	wait $!
+	BG_PIDS=""
 	set -- $(ping_stats "$TMPD/ping.idle" "$PING_COUNT")
 	R_PING=$1; R_JITTER=$2; R_LOSS=$3
+	set -- $(window_metrics "$a" "$(upcs)")
+	R_BG_DOWN=$1; R_BG_UP=$2
 
 	set_phase download
-	d=$(cf_phase down)
+	cf_phase down
+	R_DOWN=$P_MBPS; R_BYTES=$P_BYTES; code=$P_CODE
+	R_WAN_DOWN=$P_WAN; R_CPU_DOWN=$P_CPU
 	set -- $(ping_stats "$TMPD/ping.down" "$DURATION")
 	R_LOADED_DOWN=$1
 
 	set_phase upload
-	u=$(cf_phase up)
+	cf_phase up
+	R_UP=$P_MBPS; R_BYTES=$(( $(int0 "$R_BYTES") + $(int0 "$P_BYTES") ))
+	[ "$code" = 0 ] && code=$P_CODE
+	R_WAN_UP=$P_WAN; R_CPU_UP=$P_CPU
 	set -- $(ping_stats "$TMPD/ping.up" "$DURATION")
 	R_LOADED_UP=$1
 
-	set -- $d; R_DOWN=$1; R_BYTES=$2; code=$3
-	set -- $u; R_UP=$1; R_BYTES=$((R_BYTES + $2)); [ "$code" = 0 ] && code=$3
-
+	# A test that was refused or throttled by the test server says nothing
+	# about the line, so it is recorded as failed, never as a slow result.
 	case "$code" in
-		429) R_ERROR="Cloudflare rate-limited this router (HTTP 429); consider a longer interval" ;;
-		0) ;;
-		*) R_ERROR="Cloudflare returned HTTP $code" ;;
+		0|'') ;;
+		429) R_ERROR="test server refused the test: rate limit (HTTP 429)"; return 1 ;;
+		*) R_ERROR="test server refused the test (HTTP $code)"; return 1 ;;
 	esac
-	if awk -v d="$R_DOWN" -v u="$R_UP" 'BEGIN { exit !(d == 0 || u == 0) }'; then
-		[ -n "$R_ERROR" ] || R_ERROR="no data transferred (is $CF_URL reachable?)"
+	if awk -v d="$R_DOWN" -v u="$R_UP" 'BEGIN { exit !(d + 0 <= 0 || u + 0 <= 0) }'; then
+		R_ERROR="no data transferred (is $CF_URL reachable?)"
 		return 1
 	fi
-	# A partial result with a rate-limit warning is still a result.
 	return 0
 }
 
+# Third-party clients run their own phases, so only the traffic present
+# just before the test can be recorded for them.
+bg_sample() {
+	local a
+	a=$(upcs)
+	nap 3
+	set -- $(window_metrics "$a" "$(upcs)")
+	R_BG_DOWN=$1; R_BG_UP=$2
+}
+
 backend_ookla() {
-	local json args="--accept-license --accept-gdpr -f json -p no" dev
+	local json args="--accept-license --accept-gdpr -f json -p no"
 	[ -n "$OOKLA_SERVER" ] && args="$args -s $OOKLA_SERVER"
-	if [ -n "$IFACE" ]; then dev=$(wan_device); [ -n "$dev" ] && args="$args -I $dev"; fi
+	[ -n "$IFACE" ] && [ -n "$WAN_DEV" ] && args="$args -I $WAN_DEV"
+	set_phase ping
+	bg_sample
 	set_phase running
-	# shellcheck disable=SC2086
-	json=$(speedtest $args 2>"$TMPD/err" | grep '"type":"result"' | tail -n1)
+	speedtest $args > "$TMPD/out" 2> "$TMPD/err" &
+	BG_PIDS=$!
+	wait $!
+	BG_PIDS=""
+	json=$(grep '"type":"result"' "$TMPD/out" | tail -n1)
 	if [ -z "$json" ]; then
 		R_ERROR=$(head -c 200 "$TMPD/err")
 		[ -n "$R_ERROR" ] || R_ERROR="speedtest produced no result"
@@ -296,16 +462,28 @@ backend_ookla() {
 	R_DOWN=$(awk -v b="$(jf '@.download.bandwidth')" 'BEGIN { printf "%.2f", b * 8 / 1000000 }')
 	R_UP=$(awk -v b="$(jf '@.upload.bandwidth')" 'BEGIN { printf "%.2f", b * 8 / 1000000 }')
 	R_BYTES=$(( $(int0 "$(jf '@.download.bytes')") + $(int0 "$(jf '@.upload.bytes')") ))
+	if awk -v d="$R_DOWN" -v u="$R_UP" 'BEGIN { exit !(d + 0 <= 0 || u + 0 <= 0) }'; then
+		R_ERROR="speedtest reported no throughput"
+		return 1
+	fi
 	return 0
 }
 
 backend_librespeed() {
-	local json args="--json" p
+	local json args="--json" p src
 	[ -n "$LIBRESPEED_SERVER" ] && args="$args --server $LIBRESPEED_SERVER"
-	[ -n "$IFACE" ] && args="$args --source $(ifstatus "$IFACE" 2>/dev/null | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)"
+	if [ -n "$IFACE" ]; then
+		src=$(ifstatus "$IFACE" 2>/dev/null | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null)
+		case "$src" in ''|*[!0-9.]*) ;; *) args="$args --source $src" ;; esac
+	fi
+	set_phase ping
+	bg_sample
 	set_phase running
-	# shellcheck disable=SC2086
-	json=$(librespeed-cli $args 2>"$TMPD/err")
+	librespeed-cli $args > "$TMPD/out" 2> "$TMPD/err" &
+	BG_PIDS=$!
+	wait $!
+	BG_PIDS=""
+	json=$(cat "$TMPD/out")
 	# Older versions print an object, newer an array of objects.
 	p='@[0]'
 	[ -n "$(echo "$json" | jsonfilter -e '@[0].download' 2>/dev/null)" ] || p='@'
@@ -321,28 +499,38 @@ backend_librespeed() {
 	R_JITTER=$(jf jitter)
 	R_SERVER=$(jf server.name)
 	R_BYTES=$(( $(int0 "$(jf bytes_sent)") + $(int0 "$(jf bytes_received)") ))
+	if awk -v d="$R_DOWN" -v u="$R_UP" 'BEGIN { exit !(d + 0 <= 0 || u + 0 <= 0) }'; then
+		R_ERROR="librespeed-cli reported no throughput"
+		return 1
+	fi
 	return 0
 }
 
 # ------------------------------------------------------------------ store --
 
 ensure_store() {
-	mkdir -p "$(dirname "$RESULTS")"
-	[ -s "$RESULTS" ] || echo "$HEADER" > "$RESULTS"
+	mkdir -p "$(dirname "$RESULTS")" 2>/dev/null
+	if [ ! -s "$RESULTS" ]; then
+		echo "$HEADER" > "$RESULTS"
+	elif [ "$(head -n1 "$RESULTS")" != "$HEADER" ]; then
+		# Older file: columns are only ever appended, so just relabel.
+		sed -i "1s/.*/$HEADER/" "$RESULTS"
+	fi
 }
 
-append_result() { # $@ = fields
-	ensure_store
-	local IFS=,
-	echo "$*" >> "$RESULTS"
+append_result() { # $@ = fields; returns non-zero if the row was not stored
+	local lines row IFS=,
+	row="$*"
 	unset IFS
+	ensure_store 2>/dev/null
+	echo "$row" >> "$RESULTS" 2>/dev/null || return 1
 	# Trim once 10% over the limit to keep flash rewrites rare.
-	local lines
 	lines=$(wc -l < "$RESULTS")
 	if [ "$lines" -gt $(( MAX_RESULTS + MAX_RESULTS / 10 + 1 )) ]; then
 		{ echo "$HEADER"; tail -n "$MAX_RESULTS" "$RESULTS"; } > "$RESULTS.tmp" &&
 			mv "$RESULTS.tmp" "$RESULTS"
 	fi
+	return 0
 }
 
 last_ts() {
@@ -353,21 +541,38 @@ last_ts() {
 # ------------------------------------------------------------------- lock --
 
 acquire_lock() {
+	local pid tries=0
 	mkdir -p "$RUNDIR"
-	if ! mkdir "$RUNDIR/lock" 2>/dev/null; then
-		local pid
+	while ! mkdir "$RUNDIR/lock" 2>/dev/null; do
 		pid=$(cat "$RUNDIR/lock/pid" 2>/dev/null)
 		if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
 			return 1
 		fi
-		rm -rf "$RUNDIR/lock"
-		mkdir "$RUNDIR/lock" 2>/dev/null || return 1
-	fi
-	echo $$ > "$RUNDIR/lock/pid"
+		# No live owner. The owner may be between mkdir and writing its pid,
+		# so look twice before treating the lock as stale.
+		tries=$((tries + 1))
+		if [ "$tries" -ge 2 ]; then
+			rm -rf "$RUNDIR/lock"
+		else
+			sleep 1
+		fi
+		[ "$tries" -lt 4 ] || return 1
+	done
+	# $$ is the parent's pid inside a subshell; /proc/self is always us.
+	read -r pid _ < /proc/self/stat
+	echo "$pid" > "$RUNDIR/lock/pid"
 	return 0
 }
 
-release_lock() { rm -rf "$RUNDIR/lock" "$RUNDIR/phase" "$TMPD"; }
+release_lock() {
+	local f
+	[ -n "$TMPD" ] && for f in "$TMPD"/pid.*; do
+		[ -e "$f" ] && kill "$(cat "$f")" 2>/dev/null
+	done
+	kill $SAMPLER_PID $BG_PIDS $SLEEP_PID 2>/dev/null
+	SAMPLER_PID=""; BG_PIDS=""
+	rm -rf "$RUNDIR/lock" "$RUNDIR/phase" "$TMPD"
+}
 
 # --------------------------------------------------------------- commands --
 
@@ -376,16 +581,23 @@ cmd_run() {
 	[ "$1" = "--scheduled" ] && scheduled=1
 	load_config
 
+	if ! time_synced; then
+		echo "ispy: the router clock is not synchronised yet; not testing" >&2
+		return 2
+	fi
 	if ! acquire_lock; then
 		echo "ispy: a test is already running" >&2
 		return 1
 	fi
 	TMPD=$(mktemp -d /tmp/ispy.XXXXXX)
+	SAMPLER_PID=""; BG_PIDS=""; SLEEP_PID=""
 	trap 'release_lock; exit 1' INT TERM
 	backend=$(resolve_backend)
+	WAN_DEV=$(wan_device)
 
-	# Don't disturb (or be distorted by) heavy household traffic.
-	if [ "$scheduled" = 1 ] && [ "${BUSY%%.*}" -gt 0 ] 2>/dev/null; then
+	# Don't disturb (or be distorted by) heavy household traffic: look up to
+	# three times, five minutes apart, then give up on this slot.
+	if [ "$scheduled" = 1 ] && awk -v t="$BUSY" 'BEGIN { exit !(t + 0 > 0) }'; then
 		set_phase waiting
 		while :; do
 			load=$(wan_load_mbps)
@@ -393,36 +605,49 @@ cmd_run() {
 			tries=$((tries + 1))
 			if [ "$tries" -ge 3 ]; then
 				append_result "$(now)" "$backend" "" "" "" "" "" "" "" "" 0 skipped \
-					"$(clean "line busy (${load} Mbit/s > ${BUSY})")"
+					"$(clean "line busy (${load} Mbit/s > ${BUSY})")" "" "" "" "" "" "" "" "$WAN_DEV" ||
+					log "cannot write to $RESULTS"
 				log "skipped: WAN busy (${load} Mbit/s)"
 				release_lock
 				return 0
 			fi
-			log "WAN busy (${load} Mbit/s), retrying in 5 minutes"
-			sleep 300
+			log "WAN busy (${load} Mbit/s), looking again in 5 minutes"
+			nap 300
 		done
 	fi
 
 	R_SERVER=""; R_PING=""; R_JITTER=""; R_LOSS=""; R_LOADED_DOWN=""; R_LOADED_UP=""
 	R_DOWN=""; R_UP=""; R_BYTES=0; R_ERROR=""
+	R_WAN_DOWN=""; R_WAN_UP=""; R_BG_DOWN=""; R_BG_UP=""; R_CPU_DOWN=""; R_CPU_UP=""
+	R_LINK=$(link_speed "$WAN_DEV")
 	ts=$(now)
 	log "starting $backend test"
+	sampler &
+	SAMPLER_PID=$!
 
 	if backend_available "$backend" && "backend_$backend"; then
-		status=ok; message="$R_ERROR"
+		status=ok; message=""
 	else
 		status=error
 		message=${R_ERROR:-"backend $backend is not installed"}
+		# Whatever was measured before the failure is not a valid result.
+		R_DOWN=""; R_UP=""; R_WAN_DOWN=""; R_WAN_UP=""; R_CPU_DOWN=""; R_CPU_UP=""
 	fi
-	[ "$R_PING" = "-" ] && R_PING=""
-	[ "$R_JITTER" = "-" ] && R_JITTER=""
-	[ "$R_LOADED_DOWN" = "-" ] && R_LOADED_DOWN=""
-	[ "$R_LOADED_UP" = "-" ] && R_LOADED_UP=""
+	kill "$SAMPLER_PID" 2>/dev/null
+	SAMPLER_PID=""
+	for load in R_PING R_JITTER R_LOADED_DOWN R_LOADED_UP R_WAN_DOWN R_WAN_UP R_BG_DOWN R_BG_UP R_CPU_DOWN R_CPU_UP; do
+		eval "[ \"\$$load\" = - ] && $load=''"
+	done
 
-	append_result "$ts" "$backend" "$(clean "$R_SERVER")" "$R_PING" "$R_JITTER" \
-		"$R_LOSS" "$R_LOADED_DOWN" "$R_LOADED_UP" "$R_DOWN" "$R_UP" "${R_BYTES:-0}" "$status" "$(clean "$message")"
-	log "$status: down=${R_DOWN:-?} up=${R_UP:-?} Mbit/s ping=${R_PING:-?} ms ${message}"
-	tail -n1 "$RESULTS"
+	if append_result "$ts" "$backend" "$(clean "$R_SERVER")" "$R_PING" "$R_JITTER" \
+		"$R_LOSS" "$R_LOADED_DOWN" "$R_LOADED_UP" "$R_DOWN" "$R_UP" "$(int0 "$R_BYTES")" "$status" "$(clean "$message")" \
+		"$R_WAN_DOWN" "$R_WAN_UP" "$R_BG_DOWN" "$R_BG_UP" "$R_CPU_DOWN" "$R_CPU_UP" "$R_LINK" "$WAN_DEV"; then
+		tail -n1 "$RESULTS"
+	else
+		log "cannot write to $RESULTS"
+		echo "ispy: cannot write to $RESULTS" >&2
+	fi
+	log "$status: down=${R_DOWN:-?} up=${R_UP:-?} Mbit/s (line ${R_WAN_DOWN:-?}/${R_WAN_UP:-?}) ping=${R_PING:-?} ms ${message}"
 	release_lock
 	trap - INT TERM
 	[ "$status" = ok ]
@@ -434,46 +659,77 @@ cmd_start() {
 	echo started
 }
 
+# Random spread of up to 5% of the interval (max 5 min), so that tests don't
+# always land on the same minute of the hour.
+spread() {
+	awk -v i="$INTERVAL" -v s="$(( $(now) % 100000 + $$ ))" 'BEGIN { srand(s); m = i * 3; if (m > 300) m = 300; printf "%d", rand() * m }'
+}
+
 cmd_daemon() {
-	local first=1 delay jitter last t
+	local base="" sp=0 floor=0 up t last due delay
 	mkdir -p "$RUNDIR"
 	echo $$ > "$RUNDIR/daemon.pid"
-	trap 'kill "$SLEEP_PID" 2>/dev/null; rm -f "$RUNDIR/next" "$RUNDIR/daemon.pid"; exit 0' INT TERM
+	SLEEP_PID=""; TEST_PID=""
+	trap 'kill $SLEEP_PID $TEST_PID 2>/dev/null; rm -f "$RUNDIR/next" "$RUNDIR/daemon.pid"; exit 0' INT TERM
+	# The settings are re-read at least once a minute, so changes take
+	# effect even when procd's config trigger does not restart us.
 	while :; do
 		load_config
 		if [ "$ENABLED" != 1 ]; then
-			# Disabled: idle until procd restarts us on a config change.
 			rm -f "$RUNDIR/next"
-			sleep 3600 &
-			SLEEP_PID=$!
-			wait "$SLEEP_PID"
+			base=""
+			nap 60
 			continue
 		fi
-		t=$(now)
-		last=$(last_ts)
-		if [ -n "$last" ]; then
-			delay=$(( last + INTERVAL * 60 - t ))
-		else
-			delay=0
+		if ! time_synced; then
+			rm -f "$RUNDIR/next"
+			nap 20
+			continue
 		fi
-		# Give the WAN time to come up after boot / restart.
-		if [ "$first" = 1 ] && [ "$delay" -lt 120 ]; then delay=120; fi
-		[ "$delay" -lt 30 ] && delay=30
-		# Up to 5% (max 5 min) random spread so tests don't always hit :00.
-		jitter=$(awk -v i="$INTERVAL" -v s="$$$t" 'BEGIN { srand(s); m = i * 3; if (m > 300) m = 300; printf "%d", rand() * m }')
-		delay=$((delay + jitter))
-		first=0
-		echo $((t + delay)) > "$RUNDIR/next"
-		sleep "$delay" &
-		SLEEP_PID=$!
-		wait "$SLEEP_PID"
-		# Subshell: cmd_run installs its own signal traps.
-		( cmd_run --scheduled ) >/dev/null 2>&1
+		# The schedule runs on the monotonic clock ("base" is the uptime at
+		# which the previous test started), so clock steps such as NTP
+		# syncing after boot can neither stall it nor cause a burst of tests.
+		up=$(uptime_s)
+		t=$(now)
+		if [ -z "$base" ]; then
+			# (Re)start: carry on from the last stored result if it is
+			# recent, otherwise a test is due - but give the WAN two
+			# minutes to come up first.
+			last=$(last_ts)
+			if [ -n "$last" ] && [ "$last" -le "$t" ] && [ $(( t - last )) -lt $(( INTERVAL * 60 )) ]; then
+				base=$(( up - (t - last) ))
+			else
+				base=$(( up - INTERVAL * 60 ))
+			fi
+			sp=$(spread)
+			floor=$(( up + 120 ))
+		fi
+		due=$(( base + INTERVAL * 60 + sp ))
+		[ "$due" -lt "$floor" ] && due=$floor
+		if [ "$up" -lt "$due" ]; then
+			echo $(( t + due - up )) > "$RUNDIR/next"
+			delay=$(( due - up ))
+			[ "$delay" -gt 60 ] && delay=60
+			nap "$delay"
+			continue
+		fi
+		# The next slot counts from the start of this test, whether or not
+		# its result can be stored.
+		base=$up
+		sp=$(spread)
+		floor=$(( up + 30 ))
+		# Subshell: cmd_run installs its own signal traps. It runs in the
+		# background so that our own trap is not held up by the test.
+		( cmd_run --scheduled ) >/dev/null 2>&1 &
+		TEST_PID=$!
+		wait "$TEST_PID"
+		TEST_PID=""
 	done
 }
 
-json_str() { printf '"%s"' "$(printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
+json_str() { printf '"%s"' "$(printf '%s' "$1" | tr -d '\000-\037' | sed 's/\\/\\\\/g; s/"/\\"/g')"; }
 json_num() { case "$1" in ''|*[!0-9.-]*) printf 'null' ;; *) printf '%s' "$1" ;; esac; }
+json_bool() { if "$@"; then printf true; else printf false; fi; }
 
 cmd_status() {
 	local running=false phase="" sched=false next="" count=0 last="" pid b first=1
@@ -492,9 +748,9 @@ cmd_status() {
 		count=$(( $(wc -l < "$RESULTS") - 1 ))
 		[ "$count" -gt 0 ] && last=$(tail -n1 "$RESULTS")
 	fi
-	printf '{"version":%s,"enabled":%s,"scheduler":%s,"running":%s,"phase":%s,' \
-		"$(json_str "$VERSION")" "$([ "$ENABLED" = 1 ] && echo true || echo false)" \
-		"$sched" "$running" "$(json_str "$phase")"
+	printf '{"version":%s,"enabled":%s,"scheduler":%s,"running":%s,"phase":%s,"synced":%s,' \
+		"$(json_str "$VERSION")" "$(json_bool [ "$ENABLED" = 1 ])" \
+		"$sched" "$running" "$(json_str "$phase")" "$(json_bool time_synced)"
 	printf '"next_run":%s,"interval":%s,"backend":%s,"resolved_backend":%s,' \
 		"$(json_num "$next")" "$INTERVAL" "$(json_str "$BACKEND")" "$(json_str "$(resolve_backend)")"
 	printf '"count":%s,"last":%s,"now":%s,"backends":[' "$count" "$(json_str "$last")" "$(now)"
@@ -507,20 +763,44 @@ cmd_status() {
 	printf ']}\n'
 }
 
-cmd_results() { # $1=since $2=limit
-	local since="${1:-0}" limit="${2:-4000}"
+# Facts about the router and the test setup, for the report's methodology.
+cmd_meta() {
+	local model fw dev
+	load_config
+	model=$(cat /tmp/sysinfo/model 2>/dev/null)
+	fw=$( . /etc/openwrt_release 2>/dev/null; echo "$DISTRIB_DESCRIPTION" )
+	[ -r /etc/glversion ] && fw="GL.iNet $(cat /etc/glversion)${fw:+ ($fw)}"
+	dev=$(wan_device)
+	printf '{"version":%s,"model":%s,"firmware":%s,"kernel":%s,"curl":%s,' \
+		"$(json_str "$VERSION")" "$(json_str "$model")" "$(json_str "$fw")" \
+		"$(json_str "$(uname -r)")" "$(json_str "$(curl --version 2>/dev/null | head -n1 | cut -d' ' -f1-2)")"
+	printf '"dev":%s,"link_mbps":%s,"cores":%s,"zonename":%s,"tls_verified":%s,' \
+		"$(json_str "$dev")" "$(json_num "$(link_speed "$dev")")" \
+		"$(json_num "$(grep -c '^cpu[0-9]' /proc/stat)")" \
+		"$(json_str "$(uci -q get system.@system[0].zonename)")" "$(json_bool [ -z "$CURL_TLS" ])"
+	printf '"backend":%s,"resolved_backend":%s,"interval":%s,"streams":%s,"duration":%s,' \
+		"$(json_str "$BACKEND")" "$(json_str "$(resolve_backend)")" "$INTERVAL" "$STREAMS" "$DURATION"
+	printf '"ping_host":%s,"interface":%s,"busy_threshold":%s,"cf_url":%s}\n' \
+		"$(json_str "$PING_HOST")" "$(json_str "$IFACE")" "$(json_num "$BUSY")" "$(json_str "$CF_URL")"
+}
+
+cmd_results() { # $1=since $2=limit $3=offset (rows, oldest first)
+	local since="${1:-0}" limit="${2:-1500}" offset="${3:-0}"
 	load_config
 	case "$since" in ''|*[!0-9]*) since=0 ;; esac
-	case "$limit" in ''|*[!0-9]*) limit=4000 ;; esac
+	case "$limit" in ''|*[!0-9]*) limit=1500 ;; esac
+	case "$offset" in ''|*[!0-9]*) offset=0 ;; esac
 	echo "$HEADER"
 	[ -s "$RESULTS" ] || return 0
-	awk -F, -v s="$since" 'NR > 1 && $1 >= s' "$RESULTS" | tail -n "$limit"
+	awk -F, -v s="$since" -v o="$offset" -v l="$limit" '
+		NR > 1 && $1 ~ /^[0-9]+$/ && $1 + 0 >= s { n++; if (n > o && n <= o + l) print; if (n >= o + l) exit }
+	' "$RESULTS"
 }
 
 cmd_results_json() {
 	cmd_results "$@" | awk '
 		BEGIN { printf "{\"csv\":\"" }
-		{ gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); printf "%s\\n", $0 }
+		{ gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); gsub(/[\001-\037]/, ""); printf "%s\\n", $0 }
 		END { printf "\"}\n" }'
 }
 
@@ -545,6 +825,7 @@ case "$1" in
 	start) cmd_start ;;
 	daemon) cmd_daemon ;;
 	status) cmd_status ;;
+	meta) cmd_meta ;;
 	results) shift; cmd_results "$@" ;;
 	results-json) shift; cmd_results_json "$@" ;;
 	clear) cmd_clear ;;

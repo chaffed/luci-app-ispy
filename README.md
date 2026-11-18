@@ -1,41 +1,96 @@
 # ISPy — *I spy on my ISP*
 
 **ISPy** is a LuCI app for OpenWrt and GL.iNet routers. It runs internet
-speed tests on a schedule and shows what your ISP actually delivers, and when.
+speed tests on a schedule, shows what your ISP actually delivers and when, and
+produces a **printable report** comparing that with the advertised speed, for
+your provider's support team or a complaint to a regulator.
 It was built for the **GL.iNet GL-BE9300 (Flint 3)** but works on any OpenWrt
 21.02+ router with LuCI.
 
 ![ISPy dashboard (demo data)](docs/screenshot.png)
-<sub>Dashboard with 7 days of demo data. In this example the evening slowdown shows clearly in the throughput chart, the time-of-day bars and the weekly heatmap.</sub>
+<sub>Dashboard with 7 days of demo data.</sub>
 
 ## Features
 
-- **Scheduled tests** at any interval (5 min – 1 week). A random offset spreads
-  tests so they don't always land at :00. Changes in Settings take effect right away.
+- **Scheduled tests** at any interval (5 min – 1 week), around the clock, with
+  a random offset so tests don't always land on the same minute.
 - **Three test engines**:
-  - **Cloudflare**: built in, needs only `curl`. Uses parallel streams and
-    measures latency under load.
+  - **Cloudflare**: built in, needs only `curl`.
   - **Ookla speedtest CLI**: used automatically if installed.
   - **librespeed-cli**: used automatically if installed.
-- **Throughput history**: download and upload over time, against your
-  advertised plan speed. Failed or skipped tests are marked on the chart.
-  Hover any point for details.
-- **Latency and bufferbloat**: idle latency, jitter and packet loss, plus
-  latency *while the line is loaded* (download and upload separately), turned
-  into an A+…F bufferbloat grade.
-- **Patterns**: average speed by hour of day, and a weekday × hour heatmap.
-  These show when your line gets congested, e.g. *"slowest hour: 22:00, 61% of median"*.
-- **Statistics**: last, min, median, average, max and worst-5% for every
-  metric. There is also a *plan delivery* score (% of tests reaching at least
-  80% of your advertised speed) and a consistency score.
-- **Polite to your household**: optionally skips a scheduled test while WAN
-  traffic is above a threshold. It retries 3× at 5-minute intervals, then logs
-  the test as *skipped*.
-- **Data usage**: shows how much data the tests used and the projected monthly
-  total at your interval. Useful on metered connections.
-- **Multi-WAN**: tests can be bound to a specific interface.
-- **Plain CSV storage**, with CSV export from the UI and a size limit with
-  automatic trimming.
+- **Dashboard**: download and upload over time against your plan, latency and
+  an A+…F bufferbloat grade, speed by hour of day, a weekday × hour heatmap,
+  and statistics for every metric. Hover or use the arrow keys on a chart.
+- **Report** for your ISP or a regulator (see below).
+- **Evidence recorded with every test**, not just a speed:
+  - the total traffic on the WAN port while the test ran,
+  - what else was using the connection just before it,
+  - how busy the router's processor was,
+  - the WAN port's link speed, and the test server.
+- **Honest failures**: a test the server refused or throttled is stored as
+  *failed*, never as a slow result.
+- **Polite to your household**: can skip a scheduled test while the line is busy.
+- **Plain CSV storage** with export, kept across firmware upgrades.
+
+## The report
+
+**Services → ISPy Speed Monitor → Report** builds a document from your results
+that you can print, save as PDF, or download as a single HTML file.
+
+![First page of a sample report](docs/report.png)
+<sub>Sample built from synthetic data. Full sample: [docs/sample-report.pdf](docs/sample-report.pdf).</sub>
+
+It contains:
+
+1. **Summary of findings**: a plain statement of the result, the key figures,
+   and the facts behind them. If the line delivers what was advertised, the
+   report says so.
+2. **Measured vs. advertised**: median, average, best and worst, and the share
+   of tests at ≥95%, 80–95% and <80% of the advertised speed, with peak hours
+   (weekdays 7–11 pm) shown separately.
+3. **Charts**: every test over the period, day-by-day medians, how often each
+   speed level occurred, and speed by time of day.
+4. **Day-by-day table** and a list of **sustained periods** below 80%.
+5. **Latency and reliability**, including every test that failed and why.
+6. **How the measurements were made**, with a table that takes the usual
+   explanations for a slow speed test and shows what was recorded about each:
+
+   | "It's probably…" | What the report shows |
+   |---|---|
+   | your Wi-Fi or a slow device | tests run on the router, on its wired WAN port; link speed recorded |
+   | someone else using the connection | traffic before each test recorded; reported speed counts all WAN traffic |
+   | your router being too slow | processor load during each test; the highest speed it did measure |
+   | the test server | server recorded for every test |
+
+The peak period, the 95% / 80% bands and the "speed reached 80% of the time"
+measure follow the conventions the FCC used in its
+[Measuring Broadband America](https://www.fcc.gov/general/measuring-broadband-america)
+reports (2011–2024), applied to one connection. That programme has ended, but
+its reports remain the FCC's own yardstick for "delivers what it advertises".
+
+### Using it to make your case
+
+1. **Set it up properly.** Under **Settings → My plan** enter the advertised
+   speeds and your provider and account details. In the US, use the "typical"
+   download and upload speeds from the plan's
+   [Broadband Facts label](https://www.fcc.gov/broadbandlabels).
+2. **Collect at least two weeks**, ideally a month, at an hourly interval.
+   The report marks itself *preliminary* before 7 days or 50 tests.
+3. **Check the result once by hand.** Plug a computer into the router by cable
+   and run a speed test while nobody else is online. If it agrees with ISPy,
+   say so in the report's statement box.
+4. **Go to your provider first.** Send the PDF and the CSV, ask for a ticket
+   number, and note the date. Add that to the statement if you escalate.
+5. **Then the regulator.** In the US you can file a free informal complaint at
+   the [FCC Consumer Complaint Center](https://consumercomplaints.fcc.gov).
+   The FCC forwards it to the provider, which must
+   [answer you and the FCC in writing within 30 days](https://www.fcc.gov/consumers/guides/filing-informal-complaint).
+   The FCC does not investigate individual informal complaints itself; the
+   value is that the provider has to respond on the record. Your state
+   attorney general or utility commission may also take complaints.
+
+The report states measurements. It is not legal advice, and many plans are
+sold as "up to" a speed.
 
 ## Install
 
@@ -63,16 +118,17 @@ ssh root@192.168.8.1 'opkg update && opkg install /tmp/luci-app-ispy_*_all.ipk'
 (`-O` makes `scp` use the legacy protocol, because OpenWrt has no SFTP server by default.)
 
 Open **Services → ISPy Speed Monitor**. Scheduled testing starts enabled with a
-1-hour interval, and the first test runs about two minutes after install. Set your
-advertised speeds under **Settings → My plan** to get the plan reference lines and score.
+1-hour interval, and the first test runs about two minutes after install.
 
 The package is architecture-independent (shell + JavaScript). It depends only
-on `luci-base`, `curl` and `jsonfilter`, which `opkg` installs if they're missing.
+on `luci-base`, `curl` and `jsonfilter`. Upgrading from 1.0 keeps your history;
+the results file gains new columns automatically.
 
 ### Optional: Ookla speedtest CLI
 
-The Ookla CLI uses less CPU than curl and tests against your ISP's nearby
-servers. On the GL-BE9300 (aarch64):
+The Ookla CLI uses less CPU than curl and can test against a server inside
+your ISP's own network (set its ID in Settings), which removes "the test server
+was slow" as an explanation. On the GL-BE9300 (aarch64):
 
 ```sh
 cd /tmp
@@ -83,23 +139,75 @@ mv speedtest /usr/bin/ && chmod +x /usr/bin/speedtest
 
 With the backend set to **Auto**, ISPy uses it from the next test on. By using it
 you accept Ookla's [EULA](https://www.speedtest.net/about/eula); ISPy passes
-`--accept-license --accept-gdpr` for you.
+`--accept-license --accept-gdpr` for you. With third-party engines ISPy records
+their own figures plus the traffic before the test, but not WAN totals or
+processor load during the test.
 
 ## Good to know
 
 - **Data usage.** A test moves about `link speed × duration × 2` bytes. On a
   1 Gbit/s line with the default 10 s per direction, that's roughly 1.4 GB per
-  test, or about 1 TB/month at an hourly interval. The dashboard shows the real
-  figure. Use a longer interval or a shorter duration on metered or capped plans.
+  test, or about 1 TB/month at an hourly interval. Use a longer interval or a
+  shorter duration on capped plans.
 - **Rate limits.** Cloudflare's speed-test endpoint rate-limits clients that
-  test very frequently. ISPy records this as an error with a clear message
-  (`HTTP 429`) rather than a bogus 0 Mbit/s. If you see it, increase the interval.
+  move a lot of data. Such tests are stored as *failed* (`HTTP 429`). On fast
+  lines, if you see these regularly, lengthen the interval or switch to the
+  Ookla CLI.
+- **Hardware acceleration.** The "other traffic" and "WAN total" figures come
+  from the router's WAN interface counters. On routers with hardware flow
+  offloading, check once that these counters see traffic from your devices:
+  start a large download on a computer, press **Run test now**, and look at
+  *Other traffic before test* in the Statistics table. If it stays near zero,
+  the counters don't see accelerated traffic. The speed figures are still
+  valid measurements, but other devices' usage is then not credited to the
+  line, so either rely on tests from quiet hours or turn hardware acceleration
+  off while you collect evidence (the tests themselves are not affected).
 - **Router CPU.** The test runs *on the router*, so multi-gigabit results can
-  be limited by the router's CPU (TLS in curl). If the Cloudflare backend tops
-  out below your plan, try more streams, or the Ookla CLI.
-- **Storage.** Results are kept in `/etc/ispy/results.csv` (on flash, so they
-  survive reboots). One line is written per test, which causes negligible
-  flash wear. You can point it at a USB drive in Settings.
+  be limited by its processor. The report shows the processor load for exactly
+  this reason. If it is regularly above 90%, use more streams or the Ookla CLI.
+- **Multi-WAN.** With load balancing or failover, set *Test via interface* so
+  every test uses the same line. The interface is recorded with each result.
+- **Storage.** Results are kept in `/etc/ispy/results.csv`, one line per test,
+  and survive reboots and firmware upgrades ("keep settings").
+
+## How a test is measured
+
+The built-in Cloudflare engine:
+
+1. Pings a fixed host for idle latency, and uses the same seconds to measure
+   what is already flowing through the WAN port.
+2. Runs *N* parallel download streams for a fixed time. Each stream fetches
+   25 MB objects back to back over one connection.
+3. Does the same for upload with one streamed request per stream. At the
+   deadline the data source is stopped, not the request, so the figure only
+   covers data the server confirmed.
+4. Pings again during each direction for latency under load.
+
+Two figures are stored per direction:
+
+- **Test figure** (`down_mbps`, `up_mbps`): payload bytes over transfer time,
+  per stream, summed.
+- **WAN total** (`wan_down_mbps`, `wan_up_mbps`): everything the WAN interface
+  carried during the same seconds, skipping the first moments of ramp-up.
+
+The dashboard and report use **the higher of the two**. Protocol overhead and
+other devices' traffic therefore count toward the result rather than against
+it, which is the cautious direction for a document meant to show a shortfall.
+
+Tests wait until the router's clock has synchronised after boot, so every
+result carries a correct timestamp.
+
+### CSV format
+
+```text
+ts,backend,server,ping_ms,jitter_ms,loss_pct,loaded_down_ms,loaded_up_ms,
+down_mbps,up_mbps,bytes,status,message,
+wan_down_mbps,wan_up_mbps,bg_down_mbps,bg_up_mbps,cpu_down_pct,cpu_up_pct,link_mbps,dev
+```
+
+`status` is `ok`, `error` or `skipped`. `ts` is a Unix timestamp. `bg_*` is the
+traffic before the test, `cpu_*` the load of the busiest core, `link_mbps` the
+WAN port's negotiated speed and `dev` the WAN device.
 
 ## Command line
 
@@ -107,50 +215,38 @@ you accept Ookla's [EULA](https://www.speedtest.net/about/eula); ISPy passes
 ispy run          # run one test now and print the CSV line
 ispy backends     # show which engines are installed
 ispy status       # scheduler state as JSON
-ispy results [since-epoch] [limit]
+ispy meta         # router and test setup as JSON
+ispy results [since-epoch] [limit] [offset]
 ispy clear        # delete history
 ```
 
 Log messages go to the system log: `logread -e ispy`.
 
-### CSV format
-
-```text
-ts,backend,server,ping_ms,jitter_ms,loss_pct,loaded_down_ms,loaded_up_ms,down_mbps,up_mbps,bytes,status,message
-```
-
-`status` is `ok`, `error` or `skipped`. `ts` is a Unix timestamp.
-
-## How it works
+## Layout
 
 | Piece | Path |
 |---|---|
 | Test engine + scheduler | `/usr/bin/ispy` (POSIX shell, busybox-compatible) |
-| Service | `/etc/init.d/ispy` (procd, restarts on config change) |
+| Service | `/etc/init.d/ispy` (procd) |
 | Config | `/etc/config/ispy` (UCI) |
-| LuCI ↔ router API | `/usr/libexec/rpcd/luci.ispy` (ubus `luci.ispy`: `status`, `results`, `run`, `clear`) |
-| UI | `/www/luci-static/resources/view/ispy/{overview,settings}.js` (client-side LuCI views, dependency-free SVG charts) |
+| LuCI ↔ router API | `/usr/libexec/rpcd/luci.ispy` (ubus `luci.ispy`) |
+| Shared statistics and charts | `/www/luci-static/resources/ispy/common.js` |
+| Views | `/www/luci-static/resources/view/ispy/{overview,report,settings}.js` |
 
-The built-in Cloudflare engine:
-1. Measures idle latency with `ping`.
-2. Runs *N* parallel download streams for the configured duration. Each stream
-   reuses one connection for back-to-back 25 MB requests, sized so it overruns
-   the deadline by at most one chunk. Meanwhile it pings again to measure
-   latency under load.
-3. Does the same for upload, using one streamed POST per stream.
-
-Throughput is computed per stream from transfer time only, excluding TCP/TLS
-setup, then summed across streams.
-
-## Building from source
+## Development
 
 ```sh
-scripts/build-ipk.sh          # -> dist/luci-app-ispy_<ver>_all.ipk (Linux or macOS)
+node tests/analysis.test.js     # statistics behind the dashboard and report
+scripts/build-ipk.sh            # -> dist/luci-app-ispy_<ver>_all.ipk (Linux or macOS)
 ```
 
-Or drop `luci-app-ispy/` into an OpenWrt/LuCI feed (`feeds/luci/applications/`)
-and build it with the SDK as usual. Tagging `vX.Y.Z` makes GitHub Actions
-attach the `.ipk` to a release.
+`tests/fake_speedtest_server.py` is a stand-in for the Cloudflare endpoints
+with a known, throttled rate. Point `cf_url` at it to check the engine against
+a known answer.
+
+You can also drop `luci-app-ispy/` into an OpenWrt/LuCI feed
+(`feeds/luci/applications/`) and build it with the SDK. Tagging `vX.Y.Z` makes
+GitHub Actions attach the `.ipk` to a release.
 
 ## Uninstall
 

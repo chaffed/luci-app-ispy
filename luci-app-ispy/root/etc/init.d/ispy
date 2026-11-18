@@ -13,6 +13,7 @@ start_service() {
 	procd_set_param command /usr/bin/ispy daemon
 	procd_set_param file /etc/config/ispy
 	procd_set_param respawn 3600 10 0
+	procd_set_param term_timeout 15
 	procd_set_param stderr 1
 	procd_close_instance
 }
