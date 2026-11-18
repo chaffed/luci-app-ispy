@@ -12,12 +12,13 @@ SRC="$ROOT/$PKG"
 VERSION=$(sed -n 's/^PKG_VERSION:=//p' "$SRC/Makefile")
 RELEASE=$(sed -n 's/^PKG_RELEASE:=//p' "$SRC/Makefile")
 OUT=${1:-"$ROOT/dist"}
-IPK="$OUT/${PKG}_${VERSION}-r${RELEASE}_all.ipk"
 
 export COPYFILE_DISABLE=1   # no macOS ._ files in the archives
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/data/www" "$WORK/control" "$OUT"
+OUT=$(cd "$OUT" && pwd)
+IPK="$OUT/${PKG}_${VERSION}-r${RELEASE}_all.ipk"
 
 cp -R "$SRC/root/." "$WORK/data/"
 cp -R "$SRC/htdocs/." "$WORK/data/www/"
