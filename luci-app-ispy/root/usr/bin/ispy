@@ -15,6 +15,9 @@
 #   results-json [since] [limit] [offset]
 #                       same, wrapped as {"csv": "..."} for rpcd
 #   clear               delete all stored results
+#   export              save a copy of the results and the report to the
+#                       folder on an attached drive (option export_dir)
+#   export-status       print the state of that copy as JSON
 #   backends            list speed test backends usable on this router
 #
 # SPDX-License-Identifier: MIT
@@ -32,6 +35,13 @@ RUNDIR=/var/run/ispy
 HEADER="ts,backend,server,ping_ms,jitter_ms,loss_pct,loaded_down_ms,loaded_up_ms,down_mbps,up_mbps,bytes,status,message,wan_down_mbps,wan_up_mbps,bg_down_mbps,bg_up_mbps,cpu_down_pct,cpu_up_pct,link_mbps,dev"
 
 DEFAULT_RESULTS=/etc/ispy/results.csv
+
+# Copy on an attached drive: the results, and a report file that carries the
+# results and the report code from the LuCI app, so it opens anywhere.
+EXPORT_CSV=ispy-results.csv
+EXPORT_HTML=ispy-report.html
+SHARE=/usr/share/ispy
+WWW=/www/luci-static/resources/ispy
 DEFAULT_CF_URL=https://speed.cloudflare.com
 
 [ -f /lib/functions.sh ] && . /lib/functions.sh
@@ -54,6 +64,7 @@ load_config() {
 	config_get CF_URL main cf_url "$DEFAULT_CF_URL"
 	config_get OOKLA_SERVER main ookla_server ''
 	config_get LIBRESPEED_SERVER main librespeed_server ''
+	config_get EXPORT_DIR main export_dir ''
 
 	# Sanitise numbers so a bad config value cannot break arithmetic.
 	case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=60 ;; esac
@@ -83,6 +94,9 @@ load_config() {
 	case "$LIBRESPEED_SERVER" in *[!0-9]*) LIBRESPEED_SERVER='' ;; esac
 	case "$RESULTS" in /*.csv) ;; *) RESULTS=$DEFAULT_RESULTS ;; esac
 	case "$RESULTS" in *..*|*[!A-Za-z0-9._/-]*) RESULTS=$DEFAULT_RESULTS ;; esac
+	case "$EXPORT_DIR" in /*) ;; *) EXPORT_DIR='' ;; esac
+	case "$EXPORT_DIR" in *..*|*[!A-Za-z0-9._/-]*) EXPORT_DIR='' ;; esac
+	EXPORT_DIR=${EXPORT_DIR%/}
 	return 0
 }
 
@@ -538,6 +552,179 @@ last_ts() {
 	tail -n1 "$RESULTS" | cut -d, -f1 | grep -E '^[0-9]+$'
 }
 
+# ------------------------------------------------------------- drive copy --
+#
+# After every test a copy of the results and a self-contained report file
+# are saved to a folder on an attached drive (option export_dir). The file
+# on the router stays the master copy: when the drive is missing or cannot
+# be written, nothing is written anywhere else, the reason is kept for the
+# status display, and the next test simply tries again.
+
+# Mount point and filesystem type holding a path: the longest match in
+# /proc/mounts (a later mount on the same point wins).
+mount_of() { # $1=absolute path
+	awk -v p="$1" '
+		{
+			m = $2
+			if (m == "/" || p == m || index(p, m "/") == 1)
+				if (length(m) >= length(best)) { best = m; fs = $3 }
+		}
+		END { if (best != "") print best, fs }' /proc/mounts 2>/dev/null
+}
+
+# Filesystems that are the router itself (its flash, its RAM, the kernel)
+# rather than something plugged into it.
+internal_fs() {
+	case "$1" in
+		''|rootfs|overlay|squashfs|jffs2|ubifs|tmpfs|ramfs|devtmpfs|devpts|proc|sysfs) return 0 ;;
+		debugfs|tracefs|pstore|bpf|cgroup*|autofs|mqueue|securityfs|configfs|fusectl) return 0 ;;
+	esac
+	return 1
+}
+
+# Nearest existing directory at or above a path, with symlinks resolved.
+existing_dir() { # $1=absolute path
+	local d="$1"
+	while [ -n "$d" ] && [ ! -d "$d" ]; do d=${d%/*}; done
+	( cd "${d:-/}" 2>/dev/null && pwd -P )
+}
+
+# True when a folder is, or would be created, on an attached drive or a
+# network share. An unplugged drive fails: its mount point is then only an
+# empty folder on the router (in RAM on GL.iNet firmware), which is exactly
+# where a copy must not go.
+on_drive() { # $1=folder
+	set -- $(mount_of "$(existing_dir "$1")")
+	case "$1" in ''|/|/rom|/overlay) return 1 ;; esac
+	! internal_fs "$2"
+}
+
+# Mount points of attached, writable drives, as suggestions for the
+# Settings page.
+list_drives() {
+	local mp fs opts
+	while read -r _ mp fs opts _; do
+		case "$opts" in ro|ro,*) continue ;; esac
+		case "$mp" in
+			/|/rom*|/overlay*|/boot*|/proc*|/sys*|/dev*|/etc*|/lib*|/usr*|/www*|/bin*|/sbin*) continue ;;
+			*[!A-Za-z0-9._/-]*) continue ;;
+		esac
+		internal_fs "$fs" && continue
+		[ -d "$mp" ] && echo "$mp"
+	done < /proc/mounts | sort -u
+}
+
+# Outcome of the last attempt: time, ok|nodrive|error, folder, reason.
+export_state() { # $1=ok|nodrive|error $2=reason
+	mkdir -p "$RUNDIR"
+	printf '%s\n%s\n%s\n%s\n' "$(now)" "$1" "$EXPORT_DIR" "$2" > "$RUNDIR/export"
+}
+
+export_fail() { # $1=nodrive|error $2=reason; logged once, not after every test
+	[ "$(sed -n '2,4p' "$RUNDIR/export" 2>/dev/null | tr '\n' '|')" = "$1|$EXPORT_DIR|$2|" ] ||
+		log "copy to $EXPORT_DIR not saved: $2"
+	export_state "$1" "$2"
+	return 1
+}
+
+cfg_json() { local v; config_get v main "$1" ''; json_str "$v"; }
+
+# The report file. It carries the results, the settings the report needs and
+# the two modules the Report view in LuCI uses, so it draws the same report
+# in any browser, without the router (see standalone.js).
+report_html() {
+	local f
+	for f in "$SHARE/standalone.html" "$SHARE/standalone.js" "$WWW/common.js" "$WWW/report.js"; do
+		[ -r "$f" ] || return 1
+	done
+	cat "$SHARE/standalone.html" || return 1
+	# The results as text; "&" and "<" are the only characters that mean
+	# anything to a browser there.
+	printf '<pre hidden id="ispy-data">\n'
+	sed 's/&/\&amp;/g; s/</\&lt;/g' "$RESULTS" || return 1
+	printf '</pre>\n<script type="application/json" id="ispy-ctx">\n'
+	{
+		printf '{"exported":%s,"version":%s,"plan_down":%s,"plan_up":%s,' \
+			"$(now)" "$(json_str "$VERSION")" "$(cfg_json plan_down)" "$(cfg_json plan_up)"
+		printf '"sub":{"isp":%s,"plan":%s,"subscriber":%s,"account":%s,"address":%s},"meta":' \
+			"$(cfg_json isp_name)" "$(cfg_json plan_name)" "$(cfg_json subscriber)" \
+			"$(cfg_json account)" "$(cfg_json service_address)"
+		cmd_meta
+		printf '}\n'
+	} | sed 's/</\\u003c/g'
+	printf '</script>\n<script>\nvar ISPY_MODULES = {};\nISPY_MODULES.common = function(baseclass, rpc, dom) {\n'
+	cat "$WWW/common.js" || return 1
+	printf '\n};\nISPY_MODULES.report = function(baseclass, ic) {\n'
+	cat "$WWW/report.js" || return 1
+	printf '\n};\n</script>\n<script>\n'
+	cat "$SHARE/standalone.js" || return 1
+	printf '</script>\n</body>\n</html>\n'
+}
+
+export_files() {
+	local dir="$EXPORT_DIR"
+	if ! on_drive "$dir"; then
+		export_fail nodrive "the folder is not on a connected drive"
+		return 1
+	fi
+	if ! mkdir -p "$dir" 2>/dev/null || [ ! -d "$dir" ]; then
+		export_fail error "the folder cannot be created on the drive (read-only?)"
+		return 1
+	fi
+	ensure_store 2>/dev/null
+	# Each file is written next to its target and renamed only once it is
+	# complete, so a half-written file never replaces a good one.
+	if ! { cp "$RESULTS" "$dir/$EXPORT_CSV.part" && mv -f "$dir/$EXPORT_CSV.part" "$dir/$EXPORT_CSV"; } 2>/dev/null; then
+		rm -f "$dir/$EXPORT_CSV.part" 2>/dev/null
+		export_fail error "the drive cannot be written to (full or read-only?)"
+		return 1
+	fi
+	if ! { report_html > "$dir/$EXPORT_HTML.part" && mv -f "$dir/$EXPORT_HTML.part" "$dir/$EXPORT_HTML"; } 2>/dev/null; then
+		rm -f "$dir/$EXPORT_HTML.part" 2>/dev/null
+		export_fail error "the results were saved, but the report file could not be written"
+		return 1
+	fi
+	sync
+	[ "$(sed -n 2p "$RUNDIR/export" 2>/dev/null)" = ok ] || log "results and report saved to $dir"
+	export_state ok ""
+}
+
+export_now() {
+	local lock="$RUNDIR/export.lock" pid rc=0
+	[ -n "$EXPORT_DIR" ] || return 0
+	mkdir -p "$RUNDIR"
+	# One writer at a time ("save now" pressed while a test finishes).
+	if ! mkdir "$lock" 2>/dev/null; then
+		pid=$(cat "$lock/pid" 2>/dev/null)
+		[ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && return 0
+		rm -rf "$lock"
+		mkdir "$lock" 2>/dev/null || return 0
+	fi
+	read -r pid _ < /proc/self/stat
+	echo "$pid" > "$lock/pid"
+	# Readable by whoever plugs the drive into a computer, whatever umask
+	# the caller (rpcd, procd) happens to run with.
+	( umask 022; export_files ) || rc=1
+	rm -rf "$lock"
+	return "$rc"
+}
+
+# "Clear history" must not take the copy on the drive with it (the next test
+# would overwrite it), so that copy is first set aside under a dated name.
+archive_export() {
+	local dir="$EXPORT_DIR" stamp
+	[ -n "$dir" ] || return 0
+	[ -s "$dir/$EXPORT_CSV" ] || return 0
+	on_drive "$dir" || return 0
+	[ "$(wc -l < "$dir/$EXPORT_CSV")" -gt 1 ] || return 0
+	stamp=$(date +%Y%m%d-%H%M%S)
+	mv "$dir/$EXPORT_CSV" "$dir/ispy-results-until-$stamp.csv" 2>/dev/null || return 0
+	[ -e "$dir/$EXPORT_HTML" ] && mv "$dir/$EXPORT_HTML" "$dir/ispy-report-until-$stamp.html" 2>/dev/null
+	sync
+	log "history cleared; the copy on the drive was kept as ispy-results-until-$stamp.csv"
+	return 0
+}
+
 # ------------------------------------------------------------------- lock --
 
 acquire_lock() {
@@ -609,6 +796,7 @@ cmd_run() {
 					log "cannot write to $RESULTS"
 				log "skipped: WAN busy (${load} Mbit/s)"
 				release_lock
+				export_now
 				return 0
 			fi
 			log "WAN busy (${load} Mbit/s), looking again in 5 minutes"
@@ -650,6 +838,7 @@ cmd_run() {
 	log "$status: down=${R_DOWN:-?} up=${R_UP:-?} Mbit/s (line ${R_WAN_DOWN:-?}/${R_WAN_UP:-?}) ping=${R_PING:-?} ms ${message}"
 	release_lock
 	trap - INT TERM
+	export_now
 	[ "$status" = ok ]
 }
 
@@ -731,6 +920,48 @@ json_str() { printf '"%s"' "$(printf '%s' "$1" | tr -d '\000-\037' | sed 's/\\/\
 json_num() { case "$1" in ''|*[!0-9.-]*) printf 'null' ;; *) printf '%s' "$1" ;; esac; }
 json_bool() { if "$@"; then printf true; else printf false; fi; }
 
+# State of the copy on the drive, for the status display. "ok" is true or
+# false for the last attempt, or null when there has been none for this
+# folder (or the drive has come back since the last one failed).
+export_json() {
+	local ts="" st="" dir="" msg="" ok=null mounted=false
+	if [ -n "$EXPORT_DIR" ]; then
+		on_drive "$EXPORT_DIR" && mounted=true
+		if [ -r "$RUNDIR/export" ]; then
+			{ read -r ts; read -r st; read -r dir; read -r msg; } < "$RUNDIR/export"
+		fi
+		if [ "$dir" != "$EXPORT_DIR" ] || { [ "$st" = nodrive ] && [ "$mounted" = true ]; }; then
+			ts=""; msg=""
+		elif [ "$st" = ok ]; then
+			ok=true
+		else
+			ok=false
+		fi
+	fi
+	printf '{"dir":%s,"mounted":%s,"ts":%s,"ok":%s,"message":%s}' \
+		"$(json_str "$EXPORT_DIR")" "$mounted" "$(json_num "$ts")" "$ok" "$(json_str "$msg")"
+}
+
+cmd_export() {
+	load_config
+	if [ -z "$EXPORT_DIR" ]; then
+		echo "ispy: no folder is set (option export_dir)" >&2
+		return 1
+	fi
+	if export_now; then
+		echo "saved to $EXPORT_DIR"
+	else
+		echo "ispy: not saved: $(sed -n 4p "$RUNDIR/export" 2>/dev/null)" >&2
+		return 1
+	fi
+}
+
+cmd_export_status() {
+	load_config
+	export_json
+	echo
+}
+
 cmd_status() {
 	local running=false phase="" sched=false next="" count=0 last="" pid b first=1
 	load_config
@@ -753,7 +984,8 @@ cmd_status() {
 		"$sched" "$running" "$(json_str "$phase")" "$(json_bool time_synced)"
 	printf '"next_run":%s,"interval":%s,"backend":%s,"resolved_backend":%s,' \
 		"$(json_num "$next")" "$INTERVAL" "$(json_str "$BACKEND")" "$(json_str "$(resolve_backend)")"
-	printf '"count":%s,"last":%s,"now":%s,"backends":[' "$count" "$(json_str "$last")" "$(now)"
+	printf '"count":%s,"last":%s,"now":%s,"export":%s,"backends":[' \
+		"$count" "$(json_str "$last")" "$(now)" "$(export_json)"
 	for b in cloudflare ookla librespeed; do
 		if backend_available "$b"; then
 			[ "$first" = 1 ] || printf ','
@@ -765,7 +997,7 @@ cmd_status() {
 
 # Facts about the router and the test setup, for the report's methodology.
 cmd_meta() {
-	local model fw dev
+	local model fw dev d first=1
 	load_config
 	model=$(cat /tmp/sysinfo/model 2>/dev/null)
 	fw=$( . /etc/openwrt_release 2>/dev/null; echo "$DISTRIB_DESCRIPTION" )
@@ -780,8 +1012,13 @@ cmd_meta() {
 		"$(json_str "$(uci -q get system.@system[0].zonename)")" "$(json_bool [ -z "$CURL_TLS" ])"
 	printf '"backend":%s,"resolved_backend":%s,"interval":%s,"streams":%s,"duration":%s,' \
 		"$(json_str "$BACKEND")" "$(json_str "$(resolve_backend)")" "$INTERVAL" "$STREAMS" "$DURATION"
-	printf '"ping_host":%s,"interface":%s,"busy_threshold":%s,"cf_url":%s}\n' \
+	printf '"ping_host":%s,"interface":%s,"busy_threshold":%s,"cf_url":%s,"drives":[' \
 		"$(json_str "$PING_HOST")" "$(json_str "$IFACE")" "$(json_num "$BUSY")" "$(json_str "$CF_URL")"
+	for d in $(list_drives); do
+		[ "$first" = 1 ] || printf ','
+		json_str "$d"; first=0
+	done
+	printf ']}\n'
 }
 
 cmd_results() { # $1=since $2=limit $3=offset (rows, oldest first)
@@ -806,6 +1043,7 @@ cmd_results_json() {
 
 cmd_clear() {
 	load_config
+	archive_export
 	rm -f "$RESULTS"
 	ensure_store
 	log "results cleared"
@@ -829,6 +1067,8 @@ case "$1" in
 	results) shift; cmd_results "$@" ;;
 	results-json) shift; cmd_results_json "$@" ;;
 	clear) cmd_clear ;;
+	export) cmd_export ;;
+	export-status) cmd_export_status ;;
 	backends) cmd_backends ;;
 	version|--version|-v) echo "ispy $VERSION" ;;
 	*)

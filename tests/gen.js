@@ -36,7 +36,7 @@ exports.installFormat = function() {
 		return this.replace(/%(0?)(\d*)(?:\.(\d+))?([sdf%])/g, function(m, z, w, p, c) {
 			if (c === '%') return '%';
 			var v = a[i++];
-			if (c === 'd') v = String(Math.round(v)); else if (c === 'f') v = (+v).toFixed(p ? +p : 6); else v = String(v);
+			if (c === 'd') v = Math.floor(+v || 0).toFixed(0); else if (c === 'f') v = (+v).toFixed(p ? +p : 6); else v = String(v);
 			if (w) while (v.length < +w) v = (z ? '0' : ' ') + v;
 			return v;
 		});

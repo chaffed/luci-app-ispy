@@ -6,7 +6,7 @@
 
 case "$1" in
 	list)
-		echo '{"status":{},"meta":{},"results":{"since":0,"limit":0,"offset":0},"run":{},"clear":{}}'
+		echo '{"status":{},"meta":{},"results":{"since":0,"limit":0,"offset":0},"run":{},"clear":{},"export":{}}'
 		;;
 	call)
 		case "$2" in
@@ -31,6 +31,11 @@ case "$1" in
 			clear)
 				/usr/bin/ispy clear >/dev/null 2>&1
 				echo '{"cleared":true}'
+				;;
+			export)
+				# Save to the attached drive now; answer with the outcome.
+				/usr/bin/ispy export >/dev/null 2>&1
+				/usr/bin/ispy export-status
 				;;
 		esac
 		;;

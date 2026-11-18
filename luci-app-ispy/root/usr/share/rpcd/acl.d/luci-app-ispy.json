@@ -18,7 +18,8 @@
 			"ubus": {
 				"luci.ispy": [
 					"run",
-					"clear"
+					"clear",
+					"export"
 				]
 			},
 			"uci": [

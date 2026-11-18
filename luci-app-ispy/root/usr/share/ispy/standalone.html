@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="generator" content="ISPy (github.com/chaffed/luci-app-ispy)">
+<title>Internet service performance report</title>
+<style>
+:root{color-scheme:light}
+#ispy-bar{font:14px/1.45 -apple-system,"Segoe UI",Helvetica,Arial,sans-serif;color:#1c1c1e;background:#f3f4f6;border:1px solid #c9c9c9;border-radius:8px;padding:12px 14px;margin:0 0 22px}
+#ispy-bar p{margin:0 0 8px}
+#ispy-bar .row{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;margin:8px 0}
+#ispy-bar select,#ispy-bar input[type=date],#ispy-bar textarea,#ispy-bar button{font:inherit;font-size:16px;color:inherit;background:#fff;border:1px solid #8a8a8a;border-radius:6px;padding:7px 10px}
+#ispy-bar select,#ispy-bar input[type=date],#ispy-bar button{min-height:44px}
+#ispy-bar textarea{display:block;width:100%;min-height:74px;resize:vertical}
+#ispy-bar button{cursor:pointer;background:#1f5fae;border-color:#1f5fae;color:#fff;font-weight:600;padding:7px 16px}
+#ispy-bar button:hover{background:#184c8c}
+#ispy-bar :focus-visible{outline:3px solid #1f5fae;outline-offset:2px}
+#ispy-bar input[type=checkbox]{width:18px;height:18px;vertical-align:-3px}
+#ispy-bar ul{margin:8px 0 0;padding:8px 10px 8px 28px;background:#fff7e5;border:1px solid #d99a1c;border-radius:6px}
+#ispy-bar .muted{color:#555;font-size:13px}
+#ispy-problem{font:14px/1.45 -apple-system,"Segoe UI",Helvetica,Arial,sans-serif;border:1px solid #b3261e;background:#fbeeed;border-radius:6px;padding:10px 12px}
+[hidden]{display:none!important}
+@media print{#ispy-bar{display:none}}
+@media screen and (max-width:640px){
+body{padding:14px 12px}
+.tiles{grid-template-columns:repeat(2,1fr)}
+#ispy-report table{display:block;overflow-x:auto}
+}
+</style>
+</head>
+<body>
+<div id="ispy-bar" hidden>
+	<p><strong>ISPy report</strong> · <span id="ispy-saved"></span></p>
+	<div class="row">
+		<label>Period <select id="ispy-period"></select></label>
+		<span id="ispy-custom" hidden>
+			<input type="date" id="ispy-from" aria-label="From date"> – <input type="date" id="ispy-to" aria-label="To date">
+		</span>
+		<label><input type="checkbox" id="ispy-appendix"> Include a table of every test</label>
+	</div>
+	<label for="ispy-notes">Subscriber’s statement (optional; printed in the report)</label>
+	<textarea id="ispy-notes" placeholder="Anything you want the reader to know, in your own words – for example when you first reported the problem and any ticket numbers."></textarea>
+	<div class="row">
+		<button type="button" id="ispy-print">Print / save as PDF</button>
+		<span class="muted">This box is not printed. The file contains every test the router had stored when it was saved; the same data is in ispy-results.csv next to it.</span>
+	</div>
+	<ul id="ispy-hints" hidden></ul>
+</div>
+<main id="ispy-report">
+	<noscript><p>This report is drawn by a script inside this file, and scripts are switched off in this browser. The measurements themselves are in the file ispy-results.csv next to this one.</p></noscript>
+</main>

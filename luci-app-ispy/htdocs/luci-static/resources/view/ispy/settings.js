@@ -11,14 +11,19 @@
  */
 
 var callStatus = rpc.declare({ object: 'luci.ispy', method: 'status' });
+var callMeta = rpc.declare({ object: 'luci.ispy', method: 'meta' });
 
 return view.extend({
 	load: function() {
-		return callStatus().catch(function() { return {}; });
+		return Promise.all([
+			callStatus().catch(function() { return {}; }),
+			callMeta().catch(function() { return {}; })
+		]);
 	},
 
-	render: function(st) {
+	render: function(data) {
 		var m, s, o;
+		var st = data[0] || {}, drives = (data[1] || {}).drives || [];
 		var avail = (st && st.backends) || [];
 		var has = function(b) { return avail.indexOf(b) > -1; };
 
@@ -118,7 +123,8 @@ return view.extend({
 		o.datatype = 'ufloat';
 		o.optional = true;
 
-		/* Printed on the report; stored on the router only. */
+		/* Printed on the report. Stored on the router, and in the report file
+		 * on the attached drive when that copy is switched on. */
 		o = s.taboption('plan', form.Value, 'isp_name', _('Provider'), _('The following details are only used on the printable report.'));
 		o.optional = true;
 
@@ -136,10 +142,27 @@ return view.extend({
 
 		/* storage */
 		o = s.taboption('storage', form.Value, 'results_file', _('Results file'),
-			_('CSV file with one line per test; the name must end in .csv. Keep it under /etc (or a USB drive) so history survives reboots; /tmp is lost on reboot.'));
+			_('CSV file with one line per test; the name must end in .csv. Keep it on the router (under /etc) so history survives reboots; /tmp is lost on reboot. For a copy on a USB drive use the option below rather than pointing this file at the drive: results written while the drive is missing would be lost.'));
 		o.default = '/etc/ispy/results.csv';
 		o.placeholder = '/etc/ispy/results.csv';
 		o.datatype = 'string';
+
+		o = s.taboption('storage', form.Value, 'export_dir', _('Copy to a USB drive (folder)'),
+			_('After every test, ISPy saves two files to this folder: <code>ispy-results.csv</code> (all results) and <code>ispy-report.html</code> (the report, which opens in any browser without the router and prints to PDF from there). The history on the router stays the master copy; while the drive is not plugged in the copy is skipped and nothing is lost. The report file includes the details entered under “My plan”. Leave empty to switch this off.') + ' ' +
+			(drives.length
+				? _('Drives found on this router: %s.').format(drives.map(function(d) { return '<code>%h</code>'.format(d); }).join(', '))
+				: _('No attached drive is found on this router at the moment; plug one in and reload this page, or type the folder (for example <code>/mnt/sda1/ispy</code>).')));
+		o.optional = true;
+		o.rmempty = true;
+		o.placeholder = _('Off');
+		drives.forEach(function(d) { o.value(d + '/ispy'); });
+		o.validate = function(section_id, value) {
+			if (!value)
+				return true;
+			if (!/^\/[A-Za-z0-9._\/-]*$/.test(value) || value.indexOf('..') > -1)
+				return _('Enter a full folder path starting with “/”, using only letters, digits, “.”, “_”, “-” and “/”.');
+			return true;
+		};
 
 		o = s.taboption('storage', form.Value, 'max_results', _('Keep at most (tests)'),
 			_('Older results are removed beyond this count. 4000 ≈ 5.5 months at an hourly interval (~0.6 MB).'));

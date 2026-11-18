@@ -136,6 +136,7 @@ return view.extend({
 		this.nextNode = E('span', { 'class': 'ispy-muted' });
 		this.runBtn = E('button', { 'class': 'cbi-button cbi-button-action', 'click': L.bind(this.handleRun, this) }, [ _('Run test now') ]);
 		this.rangeNode = E('div', { 'class': 'ispy-ranges', 'role': 'group', 'aria-label': _('Time range') });
+		this.driveNode = E('div', { 'role': 'status' });
 		this.body = E('div');
 
 		var root = E('div', { 'class': 'cbi-map' }, [
@@ -152,6 +153,7 @@ return view.extend({
 					E('button', { 'class': 'cbi-button cbi-button-negative', 'click': L.bind(this.handleClear, this) }, [ _('Clear history') ])
 				])
 			]),
+			this.driveNode,
 			this.body
 		]);
 
@@ -209,6 +211,18 @@ return view.extend({
 			]);
 		}
 		this.nextNode.textContent = next;
+
+		/* The copy on an attached drive: only mentioned when it is not being saved. */
+		var ex = st['export'], warn = '';
+		if (ex && ex.dir && !ex.mounted)
+			warn = _('The copy on the USB drive is not being saved: no drive is connected at %s.').format(ex.dir);
+		else if (ex && ex.dir && ex.ok === false)
+			warn = _('The copy on the USB drive is not being saved: %s.').format(ex.message || _('unknown error'));
+		if (warn !== this.driveText) {
+			this.driveText = warn;
+			dom.content(this.driveNode, warn ? E('div', { 'class': 'alert-message warning' }, [ warn + ' ' + _('The history on the router is not affected.') ]) : '');
+		}
+
 		this.runBtn.disabled = !!st.running || st.synced === false;
 		this.runBtn.textContent = st.running ? _('Testing…') : _('Run test now');
 	},

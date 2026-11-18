@@ -31,6 +31,8 @@ It was built for the **GL.iNet GL-BE9300 (Flint 3)** but works on any OpenWrt
   *failed*, never as a slow result.
 - **Polite to your household**: can skip a scheduled test while the line is busy.
 - **Plain CSV storage** with export, kept across firmware upgrades.
+- **Automatic copy to a USB drive**: after every test, the results and an
+  up-to-date report file are saved to a drive plugged into the router.
 
 ## The report
 
@@ -67,6 +69,34 @@ measure follow the conventions the FCC used in its
 [Measuring Broadband America](https://www.fcc.gov/general/measuring-broadband-america)
 reports (2011–2024), applied to one connection. That programme has ended, but
 its reports remain the FCC's own yardstick for "delivers what it advertises".
+
+### Automatic copy on a USB drive
+
+Plug a drive into the router and pick its folder under **Settings → Storage →
+Copy to a USB drive**; the page lists the drives it finds. After every test
+ISPy then saves two files there:
+
+| File | What it is |
+|---|---|
+| `ispy-results.csv` | every result the router holds, same format as below |
+| `ispy-report.html` | the report as one self-contained file |
+
+`ispy-report.html` needs neither the router nor a network connection. Open it
+in any browser, choose the period, add your statement, and use **Print / save
+as PDF**. It is built by the same code as the Report page, from the same
+data, so the two say the same thing.
+
+- **The router keeps the master copy.** While the drive is unplugged, the copy
+  is skipped and the dashboard says so; nothing is written anywhere else and
+  no result is lost. The next test after the drive is back brings the files up
+  to date, or press **Save to the drive now** on the Report page.
+- **Clear history** does not delete the copy: the files on the drive are kept
+  under a dated name (`ispy-results-until-<date>.csv`).
+- The drive has to be mounted writable by the router. Which formats work
+  (FAT32, exFAT, NTFS, ext4) depends on the firmware: if the router's own
+  file sharing can write to the drive, ISPy can too.
+- The report file contains the details entered under **My plan** (name,
+  address, account number), so treat the drive accordingly.
 
 ### Using it to make your case
 
@@ -168,7 +198,9 @@ processor load during the test.
 - **Multi-WAN.** With load balancing or failover, set *Test via interface* so
   every test uses the same line. The interface is recorded with each result.
 - **Storage.** Results are kept in `/etc/ispy/results.csv`, one line per test,
-  and survive reboots and firmware upgrades ("keep settings").
+  and survive reboots and firmware upgrades ("keep settings"). For a copy on
+  a USB drive use the option described above; pointing the results file
+  itself at a drive would lose results whenever the drive is missing.
 
 ## How a test is measured
 
@@ -218,6 +250,7 @@ ispy status       # scheduler state as JSON
 ispy meta         # router and test setup as JSON
 ispy results [since-epoch] [limit] [offset]
 ispy clear        # delete history
+ispy export       # save the results and the report to the USB drive now
 ```
 
 Log messages go to the system log: `logread -e ispy`.
@@ -231,12 +264,15 @@ Log messages go to the system log: `logread -e ispy`.
 | Config | `/etc/config/ispy` (UCI) |
 | LuCI ↔ router API | `/usr/libexec/rpcd/luci.ispy` (ubus `luci.ispy`) |
 | Shared statistics and charts | `/www/luci-static/resources/ispy/common.js` |
+| Report document | `/www/luci-static/resources/ispy/report.js` |
+| Page and script of the report file saved to a drive | `/usr/share/ispy/standalone.{html,js}` |
 | Views | `/www/luci-static/resources/view/ispy/{overview,report,settings}.js` |
 
 ## Development
 
 ```sh
 node tests/analysis.test.js     # statistics behind the dashboard and report
+node tests/report.test.js       # the report file saved to a USB drive
 scripts/build-ipk.sh            # -> dist/luci-app-ispy_<ver>_all.ipk (Linux or macOS)
 ```
 
